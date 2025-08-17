@@ -298,8 +298,6 @@ def is_require_sub() -> bool:
     return row[0] != '0' if row else True
 
 async def is_subscribed_all(user_id: int) -> bool:
-    if user_id in ADMIN_IDS:
-        return True  # Админы всегда проходят проверку подписки
     channels = get_channels()
     for ch in channels:
         try:
