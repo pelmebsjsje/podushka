@@ -18,7 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
-
+from aiogram.utils.markdown import apply_html_entities
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -917,7 +917,9 @@ async def click_cb(callback: types.CallbackQuery):
     row = db_one("SELECT click_ts FROM users WHERE user_id=?", (uid,))
     last_click = row[0] if row else 0
     now = time.time()
-    if now - last_click < CLICK_COOLDOWN:
+    current_day = int(now / 86400)
+    last_day = int(last_click / 86400)
+    if current_day == last_day:
         await callback.answer("Вы уже кликнули сегодня. Попробуйте завтра.")
         return
     db_exec("UPDATE users SET points = points + ?, click_ts = ? WHERE user_id=?", (CLICK_POINTS, now, uid))
@@ -1410,7 +1412,7 @@ async def broadcast_content(msg: types.Message, state: FSMContext):
     content = ""
     if msg.photo:
         photo_id = msg.photo[-1].file_id
-        content = msg.caption_html or ""
+        content = apply_html_entities(msg.caption, msg.caption_entities) if msg.caption else ""
     elif msg.text:
         content = msg.html_text
     else:
