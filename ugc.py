@@ -19,6 +19,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
 
+import logging
+logging.basicConfig(level=logging.INFO)
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -234,8 +236,11 @@ def db_all(q: str, p: Tuple = ()) -> List[Tuple]:
     return cur.fetchall()
 
 def db_exec(q: str, p: Tuple = ()) -> None:
-    cur.execute(q, p)
-    conn.commit()
+    try:
+        cur.execute(q, p)
+        conn.commit()
+    except Exception as e:
+        logging.error(f"DB error: {e}")
 
 # Автоматическое добавление недостающих столбцов
 def ensure_columns():
@@ -1146,106 +1151,108 @@ async def hatch_egg(he_id: int, uid: int):
     rar_row = db_one("SELECT r.name FROM pets_config p JOIN rarities r ON p.rarity_id = r.id WHERE p.id=?", (pet_id,))
     rar_name = rar_row[0] if rar_row else "Unknown"
     pet_name, daily_points = pet_row
-    await notify_user(uid, f"🎉 Из яйца вылупилось: {pet_name} ({rar_name}), +{daily_points:.2f} оч./день!")
+    await notify_user(uid, f"🥚 Вылупился питомец '{pet_name}' ({rar_name})! +{daily_points:.2f} оч./день")
 
 # ========= МОИ ПИТОМЦЫ =========
 @dp.callback_query(F.data == "my_pets")
-async def my_pets(callback: types.CallbackQuery):
+async def my_pets_cb(callback: types.CallbackQuery):
     uid = callback.from_user.id
-    pets = db_all("SELECT id, pet_id, acquired_at, lives FROM user_pets WHERE user_id=?", (uid,))
+    pets = db_all("""
+        SELECT up.id, up.pet_id, up.acquired_at, up.lives, up.last_feed_day, up.feed_streak
+        FROM user_pets up
+        WHERE up.user_id = ?
+    """, (uid,))
     if not pets:
         await callback.message.edit_text("🐾 У вас нет питомцев.", reply_markup=kb_back_main())
         return
     lines = ["🐾 <b>Мои питомцы</b>:"]
-    for up_id, pet_id, acquired_at, lives in pets:
-        name, photo, daily_points = get_pet_current_stage(pet_id, acquired_at, lives)
-        lines.append(f"#{up_id}: {name} — {daily_points:.2f} оч./день, жизней: {lives}")
+    now_day = int(time.time() // 86400)
+    for up_id, pet_id, acquired_at, lives, last_day, streak in pets:
+        name, photo, dp = get_pet_current_stage(pet_id, acquired_at, lives)
+        fed_today = last_day == now_day
+        status = "💀 Мёртв" if lives <= 0 else f"❤️ {lives}/10" + (f" | Кормлен сегодня" if fed_today else " | Голодный")
+        lines.append(f"{name} | {dp:.2f} оч./день | Стрик: {streak} | {status}")
     await callback.message.edit_text("\n".join(lines), reply_markup=kb_my_pets(uid))
 
 @dp.callback_query(F.data.startswith("pet_profile:"))
-async def pet_profile(callback: types.CallbackQuery):
+async def pet_profile_cb(callback: types.CallbackQuery):
+    uid = callback.from_user.id
     parts = callback.data.split(":")
     up_id = int(parts[1])
-    row = db_one("SELECT user_id, pet_id, acquired_at, lives, last_feed_day, feed_streak FROM user_pets WHERE id=?", (up_id,))
+    row = db_one("SELECT pet_id, acquired_at, lives, last_feed_day, feed_streak FROM user_pets WHERE id=? AND user_id=?", (up_id, uid))
     if not row:
-        await callback.answer("Питомец не найден.", show_alert=True)
+        await callback.answer("Питомец не найден или не ваш.", show_alert=True)
         return
-    uid, pet_id, acquired_at, lives, last_day, streak = row
-    if uid != callback.from_user.id:
-        await callback.answer("Это не ваш питомец.", show_alert=True)
-        return
-    name, photo, daily_points = get_pet_current_stage(pet_id, acquired_at, lives)
-    now_day = int(time.time() / 86400)
+    pet_id, acquired_at, lives, last_day, streak = row
+    name, photo, dp = get_pet_current_stage(pet_id, acquired_at, lives)
+    rar_row = db_one("SELECT r.name FROM pets_config p JOIN rarities r ON p.rarity_id = r.id WHERE p.id=?", (pet_id,))
+    rar_name = rar_row[0] if rar_row else "Unknown"
+    now_day = int(time.time() // 86400)
     fed_today = last_day == now_day
-    text = f"🐶 <b>{name}</b>\n" \
-           f"Очки/день: {daily_points:.2f}\n" \
-           f"Жизней: {lives}/10\n" \
+    status = "💀 Мёртв" if lives <= 0 else f"❤️ {lives}/10" + (f" | Кормлен" if fed_today else " | Голодный")
+    text = f"🐶 <b>{name}</b> ({rar_name})\n" \
+           f"Ежедневно: {dp:.2f} оч.\n" \
            f"Стрик кормления: {streak}\n" \
-           f"Кормлен сегодня: {'да' if fed_today else 'нет'}"
+           f"Статус: {status}"
     if photo:
-        await callback.message.delete()
-        await callback.message.answer_photo(photo, caption=text, reply_markup=kb_pet_profile(up_id))
+        try:
+            await callback.message.edit_caption(caption=text, reply_markup=kb_pet_profile(up_id))
+        except:
+            await callback.message.delete()
+            await callback.message.answer_photo(photo, caption=text, reply_markup=kb_pet_profile(up_id))
     else:
         await callback.message.edit_text(text, reply_markup=kb_pet_profile(up_id))
 
 @dp.callback_query(F.data.startswith("feed:"))
 async def feed_pet_cb(callback: types.CallbackQuery):
+    uid = callback.from_user.id
     parts = callback.data.split(":")
     up_id = int(parts[1])
-    row = db_one("SELECT user_id, lives, last_feed_day, feed_streak FROM user_pets WHERE id=?", (up_id,))
+    row = db_one("SELECT lives, last_feed_day FROM user_pets WHERE id=? AND user_id=?", (up_id, uid))
     if not row:
-        await callback.answer("Питомец не найден.", show_alert=True)
+        await callback.answer("Питомец не найден или не ваш.", show_alert=True)
         return
-    uid, lives, last_day, streak = row
-    if uid != callback.from_user.id:
-        await callback.answer("Это не ваш питомец.", show_alert=True)
-        return
+    lives, last_day = row
     if lives <= 0:
         await callback.answer("Питомец мёртв.", show_alert=True)
         return
-    now_day = int(time.time() / 86400)
+    now_day = int(time.time() // 86400)
     if last_day == now_day:
         await callback.answer("Уже кормили сегодня.", show_alert=True)
         return
-    new_streak = streak + 1 if last_day == now_day - 1 else 1
+    new_streak = db_one("SELECT feed_streak FROM user_pets WHERE id=?", (up_id,))[0] + 1 if last_day == now_day - 1 else 1
     db_exec("UPDATE user_pets SET last_feed_day=?, feed_streak=? WHERE id=?", (now_day, new_streak, up_id))
-    await callback.answer("🍖 Питомец накормлен!")
-    await pet_profile(callback)
+    await callback.answer("🍖 Питомец покормлен!")
+    await pet_profile_cb(callback)  # Обновить профиль
 
 @dp.callback_query(F.data.startswith("delete_pet:"))
 async def delete_pet_cb(callback: types.CallbackQuery):
+    uid = callback.from_user.id
     parts = callback.data.split(":")
     up_id = int(parts[1])
-    row = db_one("SELECT user_id FROM user_pets WHERE id=?", (up_id,))
+    row = db_one("SELECT pet_id FROM user_pets WHERE id=? AND user_id=?", (up_id, uid))
     if not row:
-        await callback.answer("Питомец не найден.", show_alert=True)
+        await callback.answer("Питомец не найден или не ваш.", show_alert=True)
         return
-    uid = row[0]
-    if uid != callback.from_user.id:
-        await callback.answer("Это не ваш питомец.", show_alert=True)
-        return
+    pet_name = db_one("SELECT name FROM pets_config WHERE id=?", (row[0],))[0]
     db_exec("DELETE FROM user_pets WHERE id=?", (up_id,))
-    await callback.answer("🗑 Питомец удалён.")
-    await my_pets(callback)
+    await callback.message.edit_text(f"🗑 Питомец '{pet_name}' удалён.", reply_markup=kb_back_main())
 
 @dp.callback_query(F.data.startswith("transfer_pet:"))
-async def transfer_pet_start(callback: types.CallbackQuery, state: FSMContext):
-    parts = callback.data.split(":")
+async def transfer_pet_start(cb: types.CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
     up_id = int(parts[1])
-    row = db_one("SELECT user_id FROM user_pets WHERE id=?", (up_id,))
-    if not row:
-        await callback.answer("Питомец не найден.", show_alert=True)
-        return
-    uid = row[0]
-    if uid != callback.from_user.id:
-        await callback.answer("Это не ваш питомец.", show_alert=True)
+    if not db_one("SELECT 1 FROM user_pets WHERE id=? AND user_id=?", (up_id, uid)):
+        await cb.answer("Питомец не найден или не ваш.", show_alert=True)
         return
     await state.update_data(up_id=up_id)
     await state.set_state(TransferPet.target)
-    await callback.message.edit_text("🔄 Введите user_id получателя:", reply_markup=kb_back_main())
+    await cb.message.edit_text("🔄 Введите user_id получателя:", reply_markup=kb_back_main())
 
 @dp.message(TransferPet.target)
 async def transfer_pet_target(msg: types.Message, state: FSMContext):
+    if msg.from_user.id != msg.from_user.id: return  # Dummy
     try:
         target_uid = int(msg.text.strip())
     except:
@@ -1256,388 +1263,81 @@ async def transfer_pet_target(msg: types.Message, state: FSMContext):
         return
     data = await state.get_data()
     up_id = data["up_id"]
+    pet_name = db_one("""
+        SELECT p.name FROM user_pets up JOIN pets_config p ON up.pet_id = p.id WHERE up.id=?
+    """, (up_id,))[0]
     db_exec("UPDATE user_pets SET user_id=? WHERE id=?", (target_uid, up_id))
-    await notify_user(target_uid, "🔄 Вам передали питомца!")
+    await notify_user(target_uid, f"🔄 Получен питомец '{pet_name}' от {display_name(msg.from_user.id)}!")
     await state.clear()
     await msg.answer("✅ Питомец передан.", reply_markup=kb_back_main())
 
-# ========= CRYPTO SHOP =========
-def get_crypto_items_page(page: int) -> Tuple[List[Tuple[int, str, float]], int]:
-    total = db_one("SELECT COUNT(*) FROM crypto_items")[0]
-    total_pages = max(1, (total + SHOP_PAGE_SIZE - 1) // SHOP_PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    offset = page * SHOP_PAGE_SIZE
-    items = db_all("SELECT id, name, price_usdt FROM crypto_items ORDER BY id LIMIT ? OFFSET ?", (SHOP_PAGE_SIZE, offset))
-    return items, total_pages
+# ========= АДМИН: МЕНЮ =========
+@dp.callback_query(F.data == "admin_menu")
+async def admin_menu_cb(callback: types.CallbackQuery):
+    logging.info(f"Admin menu called by user {callback.from_user.id}")
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        logging.warning(f"Access denied for {callback.from_user.id}")
+        return
+    try:
+        await callback.message.edit_text("⚙ Админ-панель", reply_markup=kb_admin())
+    except TelegramBadRequest as e:
+        logging.error(f"Edit failed: {e}")
+        await callback.message.answer("⚙ Админ-панель", reply_markup=kb_admin())  # Fallback
 
-@dp.callback_query(F.data.startswith("cshop:"))
-async def cshop(callback: types.CallbackQuery):
-    if is_require_sub() and not await is_subscribed_all(callback.from_user.id):
-        channels_text = "\n".join([f"• {ch}" for ch in not_subscribed_list(callback.from_user.id)])
-        await callback.message.edit_text(
-            "❗ Чтобы пользоваться <b>Магазином Расика</b>, подпишитесь на каналы:\n"
-            f"{channels_text}\n\nПосле подписки нажмите «✅ Я подписался».",
-            reply_markup=kb_subscription_multi()
-        )
+@dp.callback_query(F.data == "admin_items")
+async def admin_items_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        return
+    await callback.message.edit_text("🛍 Управление товарами", reply_markup=kb_admin_items())
+
+@dp.callback_query(F.data == "admin_cshop")
+async def admin_cshop_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        return
+    await callback.message.edit_text("💱 Управление крипто-магазином", reply_markup=kb_admin_cshop())
+
+@dp.callback_query(F.data == "admin_orders")
+async def admin_orders_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        return
+    orders = db_all("""
+        SELECT id, user_id, item_name, price, status, created_at
+        FROM orders
+        ORDER BY created_at DESC
+        LIMIT 50
+    """)
+    text = "📦 <b>Заказы (последние 50)</b>:\n" + format_orders_list_with_names(orders)
+    await callback.message.edit_text(text, reply_markup=kb_admin())
+
+@dp.callback_query(F.data.startswith("order:"))
+async def order_status_cb(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     parts = callback.data.split(":")
-    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-
-    total = db_one("SELECT COUNT(*) FROM crypto_items")[0]
-    if total == 0:
-        await callback.message.edit_text("💱 Пока товаров в крипто-магазине нет.", reply_markup=kb_back_main())
+    if len(parts) != 3:
         return
-
-    items, total_pages = get_crypto_items_page(page)
-    rows = [[InlineKeyboardButton(text=f"{name} — {price:.2f} USDT", callback_data=f"buy_c:{iid}")]
-            for (iid, name, price) in items]
-    kb = InlineKeyboardMarkup(inline_keyboard=rows + kb_cshop_pagination(page, total_pages).inline_keyboard)
-    await callback.message.edit_text("💱 <b>Крипто-магазин</b> (USDT):", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("buy_c:"))
-async def buy_crypto(callback: types.CallbackQuery):
-    uid = callback.from_user.id
-    parts = callback.data.split(":")
-    item_id = int(parts[1])
-    item_row = db_one("SELECT name, price_usdt FROM crypto_items WHERE id=?", (item_id,))
-    if not item_row:
-        await callback.answer("Товар не найден.", show_alert=True)
-        return
-    item_name, price = item_row
-    description = f"Заказ в Магазине Расика: {item_name}"
-    inv = await crypto_create_invoice(price, description)
-    if not inv:
-        await callback.answer("Ошибка создания инвойса. Попробуйте позже.", show_alert=True)
-        return
-    invoice_id = inv["invoice_id"]
-    pay_url = inv["pay_url"]
-    db_exec("INSERT INTO crypto_orders (user_id, item_id, item_name, amount_usdt, invoice_id, pay_url) VALUES (?, ?, ?, ?, ?, ?)",
-            (uid, item_id, item_name, price, invoice_id, pay_url))
-    order_id = cur.lastrowid
-    text = f"💱 Заказ #{order_id} создан: <b>{item_name}</b> за {price:.2f} USDT.\nОплатите по ссылке."
-    await callback.message.edit_text(text, reply_markup=kb_crypto_pay(pay_url, order_id))
-    await notify_admins(f"💱 Новый крипто-заказ #{order_id} от {display_name(uid)}: {item_name} ({price:.2f} USDT)\nInvoice {invoice_id}")
-
-@dp.callback_query(F.data.startswith("chkpay:"))
-async def check_pay_cb(callback: types.CallbackQuery):
-    parts = callback.data.split(":")
     order_id = int(parts[1])
-    row = db_one("SELECT invoice_id, status FROM crypto_orders WHERE id=?", (order_id,))
+    new_status = parts[2]
+    row = db_one("SELECT user_id, item_name, status FROM orders WHERE id=?", (order_id,))
     if not row:
         await callback.answer("Заказ не найден.", show_alert=True)
         return
-    invoice_id, status = row
-    if status != 'created':
-        await callback.answer(f"Статус: {status}", show_alert=True)
+    uid, item_name, old_status = row
+    if old_status == new_status:
+        await callback.answer("Статус уже такой.", show_alert=True)
         return
-    inv = await crypto_get_invoice(invoice_id)
-    if inv and inv['status'] == 'paid':
-        db_exec("UPDATE crypto_orders SET status = 'paid' WHERE id = ?", (order_id,))
-        await callback.message.edit_text("✅ Оплата подтверждена! Ожидайте выдачи.")
-        await notify_admins(f"✅ Оплата по крипто-заказу #{order_id} (invoice {invoice_id})\nПользователь: {display_name(callback.from_user.id)}",
-                            reply_markup=kb_crypto_admin_delivered(order_id))
-    else:
-        await callback.answer("Оплата ещё не подтверждена.")
-
-@dp.callback_query(F.data.startswith("cdeliver:"))
-async def deliver_crypto_cb(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("Только админ.", show_alert=True)
-        return
-    order_id = int(callback.data.split(":")[1])
-    db_exec("UPDATE crypto_orders SET status = 'delivered' WHERE id = ?", (order_id,))
-    row = db_one("SELECT user_id, item_name FROM crypto_orders WHERE id=?", (order_id,))
-    if row:
-        uid, item_name = row
-        await notify_user(uid, f"✅ Ваш крипто-заказ #{order_id} ({item_name}) выдан!")
-    await callback.message.edit_text("✅ Отмечено как выдано.")
-
-# ========= АДМИН: ТОВАРЫ =========
-@dp.callback_query(F.data == "admin_items")
-async def admin_items(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        return
-    await cb.message.edit_text("🛍 Управление товарами", reply_markup=kb_admin_items())
-
-@dp.callback_query(F.data == "admin_list")
-async def admin_list_items(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        return
-    rows = db_all("SELECT id, name, price FROM items ORDER BY id")
-    if not rows:
-        await cb.message.edit_text("📋 Товаров нет.", reply_markup=kb_admin_items())
-        return
-    lines = ["📋 <b>Товары</b>:"]
-    for iid, name, price in rows:
-        lines.append(f"#{iid}: {name} — {price} оч.")
-    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_items())
-
-@dp.callback_query(F.data == "admin_add")
-async def admin_add_item_start(cb: types.CallbackQuery, state: FSMContext):
-    if not ensure_admin(cb): return
-    await state.set_state(AddItem.name)
-    await cb.message.edit_text("➕ Введите название товара:", reply_markup=kb_back_main())
-
-@dp.message(AddItem.name)
-async def admin_add_item_name(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    name = msg.text.strip()
-    if not name:
-        await msg.answer("Название не может быть пустым.")
-        return
-    await state.update_data(name=name)
-    await state.set_state(AddItem.price)
-    await msg.answer("Цена (int >0):", reply_markup=kb_back_main())
-
-@dp.message(AddItem.price)
-async def admin_add_item_price(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
+    db_exec("UPDATE orders SET status=? WHERE id=?", (new_status, order_id))
+    human = {"processing": "в обработке", "done": "выполнен", "canceled": "отменён"}.get(new_status, new_status)
+    await notify_user(uid, f"🧾 Заказ #{order_id} ({item_name}) теперь <i>{human}</i>.")
+    await callback.answer(f"Статус изменён на {human}.")
+    # Обновить сообщение админа
     try:
-        price = int(msg.text.strip())
-        if price <= 0:
-            raise ValueError
+        await callback.message.edit_reply_markup(reply_markup=None)
     except:
-        await msg.answer("Цена - целое >0.")
-        return
-    data = await state.get_data()
-    db_exec("INSERT INTO items (name, price) VALUES (?, ?)", (data["name"], price))
-    await state.clear()
-    await msg.answer("✅ Товар добавлен.", reply_markup=kb_admin_items())
+        pass
 
-@dp.callback_query(F.data == "admin_edit")
-async def admin_edit_item_start(cb: types.CallbackQuery, state: FSMContext):
-    if not ensure_admin(cb): return
-    await state.set_state(EditItem.id)
-    await cb.message.edit_text("✏ Введите ID товара:", reply_markup=kb_back_main())
-
-@dp.message(EditItem.id)
-async def admin_edit_item_id(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    try:
-        iid = int(msg.text.strip())
-    except:
-        await msg.answer("ID - число.")
-        return
-    if not db_one("SELECT 1 FROM items WHERE id=?", (iid,)):
-        await msg.answer("Товар не найден.")
-        return
-    await state.update_data(id=iid)
-    await state.set_state(EditItem.name)
-    await msg.answer("Новое название (или . пропуск):", reply_markup=kb_back_main())
-
-@dp.message(EditItem.name)
-async def admin_edit_item_name(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    name = msg.text.strip()
-    await state.update_data(name=None if name == '.' else name)
-    await state.set_state(EditItem.price)
-    await msg.answer("Новая цена (или . пропуск):", reply_markup=kb_back_main())
-
-@dp.message(EditItem.price)
-async def admin_edit_item_price(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    txt = msg.text.strip()
-    price = None
-    if txt != '.':
-        try:
-            price = int(txt)
-            if price <= 0:
-                raise ValueError
-        except:
-            await msg.answer("Цена - целое >0.")
-            return
-    data = await state.get_data()
-    iid = data["id"]
-    updates = []
-    params = []
-    if data["name"] is not None:
-        updates.append("name=?")
-        params.append(data["name"])
-    if price is not None:
-        updates.append("price=?")
-        params.append(price)
-    if not updates:
-        await state.clear()
-        await msg.answer("Ничего не изменено.", reply_markup=kb_admin_items())
-        return
-    q = "UPDATE items SET " + ", ".join(updates) + " WHERE id=?"
-    params.append(iid)
-    db_exec(q, tuple(params))
-    await state.clear()
-    await msg.answer("✅ Товар обновлён.", reply_markup=kb_admin_items())
-
-@dp.callback_query(F.data == "admin_del")
-async def admin_del_item_start(cb: types.CallbackQuery, state: FSMContext):
-    if not ensure_admin(cb): return
-    await state.set_state(DelItem.id)
-    await cb.message.edit_text("🗑 Введите ID товара для удаления:", reply_markup=kb_back_main())
-
-@dp.message(DelItem.id)
-async def admin_del_item_id(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    try:
-        iid = int(msg.text.strip())
-    except:
-        await msg.answer("ID - число.")
-        return
-    row = db_one("SELECT name FROM items WHERE id=?", (iid,))
-    if not row:
-        await msg.answer("Товар не найден.")
-        return
-    db_exec("DELETE FROM items WHERE id=?", (iid,))
-    await state.clear()
-    await msg.answer(f"🗑 Удалён товар '{row[0]}'.", reply_markup=kb_admin_items())
-
-# --- Админ: Крипто-магазин
-@dp.callback_query(F.data == "admin_cshop")
-async def admin_cshop(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        return
-    await cb.message.edit_text("💱 Управление крипто-магазином", reply_markup=kb_admin_cshop())
-
-@dp.callback_query(F.data == "cadmin_list")
-async def cadmin_list_items(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        return
-    rows = db_all("SELECT id, name, price_usdt FROM crypto_items ORDER BY id")
-    if not rows:
-        await cb.message.edit_text("📋 Товаров нет.", reply_markup=kb_admin_cshop())
-        return
-    lines = ["📋 <b>Крипто-товары</b>:"]
-    for iid, name, price in rows:
-        lines.append(f"#{iid}: {name} — {price:.2f} USDT")
-    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_cshop())
-
-@dp.callback_query(F.data == "cadmin_add")
-async def cadmin_add_item_start(cb: types.CallbackQuery, state: FSMContext):
-    if not ensure_admin(cb): return
-    await state.set_state(CAdd.name)
-    await cb.message.edit_text("➕ Введите название крипто-товара:", reply_markup=kb_back_main())
-
-@dp.message(CAdd.name)
-async def cadmin_add_item_name(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    name = msg.text.strip()
-    if not name:
-        await msg.answer("Название не может быть пустым.")
-        return
-    await state.update_data(name=name)
-    await state.set_state(CAdd.price)
-    await msg.answer("Цена в USDT (float >0):", reply_markup=kb_back_main())
-
-@dp.message(CAdd.price)
-async def cadmin_add_item_price(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    try:
-        price = float(msg.text.strip())
-        if price <= 0:
-            raise ValueError
-    except:
-        await msg.answer("Цена - число >0.")
-        return
-    data = await state.get_data()
-    db_exec("INSERT INTO crypto_items (name, price_usdt) VALUES (?, ?)", (data["name"], price))
-    await state.clear()
-    await msg.answer("✅ Крипто-товар добавлен.", reply_markup=kb_admin_cshop())
-
-@dp.callback_query(F.data == "cadmin_edit")
-async def cadmin_edit_item_start(cb: types.CallbackQuery, state: FSMContext):
-    if not ensure_admin(cb): return
-    await state.set_state(CEdit.id)
-    await cb.message.edit_text("✏ Введите ID крипто-товара:", reply_markup=kb_back_main())
-
-@dp.message(CEdit.id)
-async def cadmin_edit_item_id(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    try:
-        iid = int(msg.text.strip())
-    except:
-        await msg.answer("ID - число.")
-        return
-    if not db_one("SELECT 1 FROM crypto_items WHERE id=?", (iid,)):
-        await msg.answer("Товар не найден.")
-        return
-    await state.update_data(id=iid)
-    await state.set_state(CEdit.name)
-    await msg.answer("Новое название (или . пропуск):", reply_markup=kb_back_main())
-
-@dp.message(CEdit.name)
-async def cadmin_edit_item_name(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    name = msg.text.strip()
-    await state.update_data(name=None if name == '.' else name)
-    await state.set_state(CEdit.price)
-    await msg.answer("Новая цена (или . пропуск):", reply_markup=kb_back_main())
-
-@dp.message(CEdit.price)
-async def cadmin_edit_item_price(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    txt = msg.text.strip()
-    price = None
-    if txt != '.':
-        try:
-            price = float(txt)
-            if price <= 0:
-                raise ValueError
-        except:
-            await msg.answer("Цена - число >0.")
-            return
-    data = await state.get_data()
-    iid = data["id"]
-    updates = []
-    params = []
-    if data["name"] is not None:
-        updates.append("name=?")
-        params.append(data["name"])
-    if price is not None:
-        updates.append("price_usdt=?")
-        params.append(price)
-    if not updates:
-        await state.clear()
-        await msg.answer("Ничего не изменено.", reply_markup=kb_admin_cshop())
-        return
-    q = "UPDATE crypto_items SET " + ", ".join(updates) + " WHERE id=?"
-    params.append(iid)
-    db_exec(q, tuple(params))
-    await state.clear()
-    await msg.answer("✅ Крипто-товар обновлён.", reply_markup=kb_admin_cshop())
-
-@dp.callback_query(F.data == "cadmin_del")
-async def cadmin_del_item_start(cb: types.CallbackQuery, state: FSMContext):
-    if not ensure_admin(cb): return
-    await state.set_state(CDel.id)
-    await cb.message.edit_text("🗑 Введите ID крипто-товара для удаления:", reply_markup=kb_back_main())
-
-@dp.message(CDel.id)
-async def cadmin_del_item_id(msg: types.Message, state: FSMContext):
-    if not ensure_admin(msg): return
-    try:
-        iid = int(msg.text.strip())
-    except:
-        await msg.answer("ID - число.")
-        return
-    row = db_one("SELECT name FROM crypto_items WHERE id=?", (iid,))
-    if not row:
-        await msg.answer("Товар не найден.")
-        return
-    db_exec("DELETE FROM crypto_items WHERE id=?", (iid,))
-    await state.clear()
-    await msg.answer(f"🗑 Удалён крипто-товар '{row[0]}'.", reply_markup=kb_admin_cshop())
-
-@dp.callback_query(F.data == "cadmin_orders")
-async def cadmin_orders(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        return
-    rows = db_all("""
-        SELECT id, user_id, invoice_id, item_name, amount_usdt, status, created_at
-        FROM crypto_orders
-        ORDER BY id DESC
-        LIMIT 50
-    """)
-    text = "🧾 <b>Последние крипто-заказы</b>:\n" + format_crypto_orders_with_names(rows)
-    await cb.message.edit_text(text, reply_markup=kb_admin_cshop())
-
-# --- Админ: Выдать очки
 @dp.callback_query(F.data == "admin_give_points")
 async def admin_give_points_start(cb: types.CallbackQuery, state: FSMContext):
     if not ensure_admin(cb): return
@@ -1657,84 +1357,48 @@ async def admin_give_points_uid(msg: types.Message, state: FSMContext):
         return
     await state.update_data(user_id=uid)
     await state.set_state(GivePoints.amount)
-    await msg.answer("Количество очков (float >0):", reply_markup=kb_back_main())
+    await msg.answer("Количество очков (float, может быть отриц.):", reply_markup=kb_back_main())
 
 @dp.message(GivePoints.amount)
-async def admin_give_points_amount(msg: types.Message, state: FSMContext):
+async def admin_give_points_amt(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     try:
         amt = float(msg.text.strip())
-        if amt <= 0:
-            raise ValueError
     except:
-        await msg.answer("Количество - число >0.")
+        await msg.answer("Количество - число.")
         return
     data = await state.get_data()
     uid = data["user_id"]
     db_exec("UPDATE users SET points = points + ? WHERE user_id=?", (amt, uid))
-    await notify_user(uid, f"➕ Админ выдал вам {amt:.2f} очков!")
+    sign = "+" if amt > 0 else ""
+    await notify_user(uid, f"➕ Админ выдал {sign}{amt:.2f} очков!")
     await state.clear()
-    await msg.answer("✅ Очки выданы.", reply_markup=kb_admin())
+    await msg.answer(f"✅ Выдано {amt:.2f} очков пользователю {display_name(uid)}.", reply_markup=kb_admin())
 
-# --- Админ: Заказы
-@dp.callback_query(F.data == "admin_orders")
-async def admin_orders(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        return
-    orders = db_all("""
-        SELECT id, user_id, item_name, price, status, created_at
-        FROM orders
-        ORDER BY id DESC
-        LIMIT 50
-    """)
-    text = "📦 <b>Последние заказы</b>:\n" + format_orders_list_with_names(orders)
-    await cb.message.edit_text(text, reply_markup=kb_admin())
-
-@dp.callback_query(F.data.startswith("order:"))
-async def order_status_cb(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("Только админ.", show_alert=True)
-        return
-    parts = callback.data.split(":")
-    order_id = int(parts[1])
-    new_status = parts[2]
-    db_exec("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
-    row = db_one("SELECT user_id, item_name FROM orders WHERE id=?", (order_id,))
-    if row:
-        uid, item_name = row
-        human = {"processing": "в обработке", "done": "выполнен", "canceled": "отменён"}.get(new_status, new_status)
-        await notify_user(uid, f"🧾 Ваш заказ #{order_id} ({item_name}) теперь <i>{human}</i>.")
-    await callback.answer(f"Статус изменён на {new_status}")
-    await callback.message.edit_text(callback.message.text + f"\n\n✅ Статус изменён на {new_status}.")
-
-# --- Админ: Пользователи
 @dp.callback_query(F.data.startswith("admin_users:"))
-async def admin_users(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        return
-    parts = cb.data.split(":")
+async def admin_users_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback): return
+    parts = callback.data.split(":")
     page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     total = db_one("SELECT COUNT(*) FROM users")[0]
     total_pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     offset = page * USERS_PAGE_SIZE
-    rows = db_all("""
-        SELECT user_id, username, full_name, points, created_at
+    users = db_all("""
+        SELECT user_id, points, created_at
         FROM users
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
     """, (USERS_PAGE_SIZE, offset))
-    lines = [f"👥 <b>Пользователи (страница {page+1}/{total_pages}, всего {total})</b>:"]
-    for uid, uname, fname, pts, ts in rows:
-        disp = display_name(uid)
+    lines = [f"👥 <b>Пользователи (страница {page+1}/{total_pages})</b>:"]
+    for uid, pts, ts in users:
         t = time.strftime("%d.%m %H:%M", time.localtime(ts))
-        lines.append(f"{disp} — {pts:.2f} оч. — {t}")
-    await cb.message.edit_text("\n".join(lines), reply_markup=kb_users_pagination(page, total_pages))
+        lines.append(f"{display_name(uid)} / {uid} — {pts:.2f} оч. ({t})")
+    await callback.message.edit_text("\n".join(lines), reply_markup=kb_users_pagination(page, total_pages))
 
 @dp.callback_query(F.data == "admin_export_users")
 async def admin_export_users(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        return
+    if not ensure_admin(cb): return
     rows = db_all("""
         SELECT user_id, username, full_name, points, created_at
         FROM users
@@ -1744,61 +1408,57 @@ async def admin_export_users(cb: types.CallbackQuery):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["user_id", "username", "full_name", "points", "created_at"])
-        w.writerows(rows)
+        for row in rows:
+            row = list(row)
+            row[4] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[4]))
+            w.writerow(row)
     await cb.message.answer_document(FSInputFile(path))
     os.remove(path)
 
-# --- Админ: Рассылка
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(cb: types.CallbackQuery, state: FSMContext):
     if not ensure_admin(cb): return
     await state.set_state(Broadcast.content)
-    await cb.message.edit_text("📢 Отправьте контент для рассылки (текст, фото, видео и т.д.):", reply_markup=kb_back_main())
+    await cb.message.edit_text("📢 Введите текст рассылки (или отправьте фото/видео/документ/аудио/войс с подписью):", reply_markup=kb_back_main())
 
 @dp.message(Broadcast.content)
-async def broadcast_content(msg: types.Message, state: FSMContext):
+async def admin_broadcast_content(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
-    content = msg.html_text if (msg.text or msg.caption) else ""  # Используем msg.html_text для текста или caption
-    if msg.photo or msg.video or msg.document or msg.audio or msg.voice:
-        # Если есть медиа, сохраняем file_id
-        if msg.photo:
-            file_id = msg.photo[-1].file_id
-            media_type = 'photo'
-        elif msg.video:
-            file_id = msg.video.file_id
-            media_type = 'video'
-        elif msg.document:
-            file_id = msg.document.file_id
-            media_type = 'document'
-        elif msg.audio:
-            file_id = msg.audio.file_id
-            media_type = 'audio'
-        elif msg.voice:
-            file_id = msg.voice.file_id
-            media_type = 'voice'
-        await state.update_data(content=content, media_type=media_type, file_id=file_id)
-    else:
-        await state.update_data(content=content)
+    content = msg.html_text or msg.caption_html
+    media_type = None
+    file_id = None
+    if msg.photo:
+        media_type = 'photo'
+        file_id = msg.photo[-1].file_id
+    elif msg.video:
+        media_type = 'video'
+        file_id = msg.video.file_id
+    elif msg.document:
+        media_type = 'document'
+        file_id = msg.document.file_id
+    elif msg.audio:
+        media_type = 'audio'
+        file_id = msg.audio.file_id
+    elif msg.voice:
+        media_type = 'voice'
+        file_id = msg.voice.file_id
+    await state.update_data(content=content, media_type=media_type, file_id=file_id)
     await state.set_state(Broadcast.btn_choice)
     await msg.answer("Добавить кнопку? (да/нет):", reply_markup=kb_back_main())
 
 @dp.message(Broadcast.btn_choice)
-async def broadcast_btn_choice(msg: types.Message, state: FSMContext):
+async def admin_broadcast_btn_choice(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     choice = msg.text.strip().lower()
-    if choice not in ('да', 'нет'):
-        await msg.answer("Да или нет?")
-        return
-    if choice == 'нет':
-        await state.update_data(btn_text=None, btn_url=None)
+    if choice == 'да':
+        await state.set_state(Broadcast.btn_text)
+        await msg.answer("Текст кнопки:", reply_markup=kb_back_main())
+    else:
         await state.set_state(Broadcast.confirm)
-        await msg.answer("Подтвердите рассылку (да/нет):", reply_markup=kb_back_main())
-        return
-    await state.set_state(Broadcast.btn_text)
-    await msg.answer("Текст кнопки:", reply_markup=kb_back_main())
+        await msg.answer("Подтвердить рассылку? (да/нет):", reply_markup=kb_back_main())
 
 @dp.message(Broadcast.btn_text)
-async def broadcast_btn_text(msg: types.Message, state: FSMContext):
+async def admin_broadcast_btn_text(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     btn_text = msg.text.strip()
     if not btn_text:
@@ -1809,18 +1469,18 @@ async def broadcast_btn_text(msg: types.Message, state: FSMContext):
     await msg.answer("URL кнопки:", reply_markup=kb_back_main())
 
 @dp.message(Broadcast.btn_url)
-async def broadcast_btn_url(msg: types.Message, state: FSMContext):
+async def admin_broadcast_btn_url(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     btn_url = msg.text.strip()
     if not btn_url.startswith("http"):
-        await msg.answer("URL должен начинаться с http(s).")
+        await msg.answer("URL должен начинаться с http.")
         return
     await state.update_data(btn_url=btn_url)
     await state.set_state(Broadcast.confirm)
-    await msg.answer("Подтвердите рассылку (да/нет):", reply_markup=kb_back_main())
+    await msg.answer("Подтвердить рассылку? (да/нет):", reply_markup=kb_back_main())
 
 @dp.message(Broadcast.confirm)
-async def broadcast_confirm(msg: types.Message, state: FSMContext):
+async def admin_broadcast_confirm(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     choice = msg.text.strip().lower()
     if choice != 'да':
@@ -1878,7 +1538,10 @@ async def admin_export(cb: types.CallbackQuery):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["id", "user_id", "item_name", "price", "status", "created_at"])
-        w.writerows(rows)
+        for row in rows:
+            row = list(row)
+            row[5] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[5]))
+            w.writerow(row)
     await cb.message.answer_document(FSInputFile(path))
     os.remove(path)
 
@@ -2970,14 +2633,407 @@ async def auto_pet_management_task():
                 if new_lives == 0:
                     await notify_user(uid, "❗ Один из ваших питомцев умер от голода!")
 
+# ========= КРИПТО-МАГАЗИН =========
+def get_citems_page(page: int) -> Tuple[List[Tuple[int, str, float]], int]:
+    total = db_one("SELECT COUNT(*) FROM crypto_items")[0]
+    total_pages = max(1, (total + SHOP_PAGE_SIZE - 1) // SHOP_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    offset = page * SHOP_PAGE_SIZE
+    items = db_all("SELECT id, name, price_usdt FROM crypto_items ORDER BY id LIMIT ? OFFSET ?", (SHOP_PAGE_SIZE, offset))
+    return items, total_pages
+
+@dp.callback_query(F.data.startswith("cshop:"))
+async def cshop(callback: types.CallbackQuery):
+    if is_require_sub() and not await is_subscribed_all(callback.from_user.id):
+        channels_text = "\n".join([f"• {ch}" for ch in not_subscribed_list(callback.from_user.id)])
+        await callback.message.edit_text(
+            "❗ Чтобы пользоваться <b>Магазином Расика</b>, подпишитесь на каналы:\n"
+            f"{channels_text}\n\nПосле подписки нажмите «✅ Я подписался».",
+            reply_markup=kb_subscription_multi()
+        )
+        return
+    parts = callback.data.split(":")
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+    total = db_one("SELECT COUNT(*) FROM crypto_items")[0]
+    if total == 0:
+        await callback.message.edit_text("💱 Пока товаров нет.", reply_markup=kb_back_main())
+        return
+
+    items, total_pages = get_citems_page(page)
+    rows = [[InlineKeyboardButton(text=f"{name} — {price:.2f} USDT", callback_data=f"cbuy:{iid}")]
+            for (iid, name, price) in items]
+    kb = InlineKeyboardMarkup(inline_keyboard=rows + kb_cshop_pagination(page, total_pages).inline_keyboard)
+    await callback.message.edit_text("💱 <b>Крипто-магазин</b> (USDT):", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("cbuy:"))
+async def cbuy(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    parts = callback.data.split(":")
+    item_id = int(parts[1])
+    item_row = db_one("SELECT name, price_usdt FROM crypto_items WHERE id=?", (item_id,))
+    if not item_row:
+        await callback.answer("Товар не найден.", show_alert=True)
+        return
+    item_name, amount = item_row
+    inv = await crypto_create_invoice(amount, f"Заказ {item_name} в Магазине Расика")
+    if not inv:
+        await callback.answer("Ошибка создания инвойса. Проверьте CRYPTO_TOKEN.", show_alert=True)
+        return
+    invoice_id = int(inv["invoice_id"])
+    pay_url = inv["pay_url"]
+    db_exec("INSERT INTO crypto_orders (user_id, item_id, item_name, amount_usdt, invoice_id, pay_url) VALUES (?, ?, ?, ?, ?, ?)",
+            (uid, item_id, item_name, amount, invoice_id, pay_url))
+    order_id = cur.lastrowid
+    text = f"💳 Заказ #{order_id} создан: <b>{item_name}</b> за {amount:.2f} USDT.\n" \
+           f"Оплатите по ссылке ниже."
+    await callback.message.edit_text(text, reply_markup=kb_crypto_pay(pay_url, order_id))
+    await notify_admins(
+        f"🆕 Новый крипто-заказ #{order_id} от {display_name(uid)}: {item_name} ({amount:.2f} USDT)\n"
+        f"Invoice {invoice_id}: {pay_url}"
+    )
+
+@dp.callback_query(F.data.startswith("chkpay:"))
+async def chkpay_cb(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    order_id = int(parts[1])
+    row = db_one("SELECT invoice_id, status, item_name FROM crypto_orders WHERE id=?", (order_id,))
+    if not row:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+    invoice_id, status, item_name = row
+    if status != 'created':
+        human = {"paid": "оплачен", "delivered": "выдан", "canceled": "отменён"}.get(status, status)
+        await callback.answer(f"Заказ уже {human}.", show_alert=True)
+        return
+    inv = await crypto_get_invoice(invoice_id)
+    if not inv:
+        await callback.answer("Ошибка проверки. Попробуйте позже.", show_alert=True)
+        return
+    if inv['status'] == 'paid':
+        db_exec("UPDATE crypto_orders SET status = 'paid' WHERE id = ?", (order_id,))
+        await callback.answer("✅ Оплата подтверждена!")
+        await notify_admins(
+            f"✅ Оплата получена по крипто-заказу #{order_id} (invoice {invoice_id})\n"
+            f"Пользователь: {display_name(callback.from_user.id)} / {callback.from_user.id}\n"
+            f"Товар: {item_name} — {inv['amount']:.2f} USDT",
+            reply_markup=kb_crypto_admin_delivered(order_id)
+        )
+        await callback.message.edit_text(f"✅ Заказ #{order_id} оплачен. Ожидайте выдачи.", reply_markup=kb_back_main())
+    else:
+        await callback.answer("Оплата ещё не поступила.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("cdeliver:"))
+async def cdeliver_cb(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    order_id = int(parts[1])
+    row = db_one("SELECT user_id, item_name, status FROM crypto_orders WHERE id=?", (order_id,))
+    if not row:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+    uid, item_name, status = row
+    if status != 'paid':
+        await callback.answer("Заказ не оплачен.", show_alert=True)
+        return
+    db_exec("UPDATE crypto_orders SET status='delivered' WHERE id=?", (order_id,))
+    await notify_user(uid, f"✅ Заказ #{order_id} ({item_name}) выдан.")
+    await callback.answer("✅ Отмечено как выдано.")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+
+@dp.callback_query(F.data == "cadmin_orders")
+async def cadmin_orders_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        return
+    rows = db_all("""
+        SELECT id, user_id, invoice_id, item_name, amount_usdt, status, created_at
+        FROM crypto_orders
+        ORDER BY created_at DESC
+        LIMIT 50
+    """)
+    text = "🧾 <b>Крипто-заказы (последние 50)</b>:\n" + format_crypto_orders_with_names(rows)
+    await callback.message.edit_text(text, reply_markup=kb_admin_cshop())
+
+@dp.callback_query(F.data == "admin_add")
+async def admin_add_start(cb: types.CallbackQuery, state: FSMContext):
+    if not ensure_admin(cb): return
+    await state.set_state(AddItem.name)
+    await cb.message.edit_text("➕ Введите название товара:", reply_markup=kb_back_main())
+
+@dp.message(AddItem.name)
+async def admin_add_name(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    name = msg.text.strip()
+    if not name:
+        await msg.answer("Название не может быть пустым.")
+        return
+    await state.update_data(name=name)
+    await state.set_state(AddItem.price)
+    await msg.answer("Цена (int >0):", reply_markup=kb_back_main())
+
+@dp.message(AddItem.price)
+async def admin_add_price(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    try:
+        price = int(msg.text.strip())
+        if price <= 0:
+            raise ValueError
+    except:
+        await msg.answer("Цена - целое >0.")
+        return
+    data = await state.get_data()
+    db_exec("INSERT INTO items (name, price) VALUES (?, ?)", (data["name"], price))
+    await state.clear()
+    await msg.answer("✅ Товар добавлен.", reply_markup=kb_admin_items())
+
+@dp.callback_query(F.data == "admin_edit")
+async def admin_edit_start(cb: types.CallbackQuery, state: FSMContext):
+    if not ensure_admin(cb): return
+    await state.set_state(EditItem.id)
+    await cb.message.edit_text("✏ Введите ID товара:", reply_markup=kb_back_main())
+
+@dp.message(EditItem.id)
+async def admin_edit_id(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    try:
+        iid = int(msg.text.strip())
+    except:
+        await msg.answer("ID - число.")
+        return
+    if not db_one("SELECT 1 FROM items WHERE id=?", (iid,)):
+        await msg.answer("Товар не найден.")
+        return
+    await state.update_data(id=iid)
+    await state.set_state(EditItem.name)
+    await msg.answer("Новое название (или . пропуск):", reply_markup=kb_back_main())
+
+@dp.message(EditItem.name)
+async def admin_edit_name(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    name = msg.text.strip()
+    await state.update_data(name=None if name == '.' else name)
+    await state.set_state(EditItem.price)
+    await msg.answer("Новая цена (или . пропуск):", reply_markup=kb_back_main())
+
+@dp.message(EditItem.price)
+async def admin_edit_price(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    txt = msg.text.strip()
+    price = None
+    if txt != '.':
+        try:
+            price = int(txt)
+            if price <= 0:
+                raise ValueError
+        except:
+            await msg.answer("Цена - целое >0.")
+            return
+    data = await state.get_data()
+    iid = data["id"]
+    updates = []
+    params = []
+    if data["name"] is not None:
+        updates.append("name=?")
+        params.append(data["name"])
+    if price is not None:
+        updates.append("price=?")
+        params.append(price)
+    if not updates:
+        await state.clear()
+        await msg.answer("Ничего не изменено.", reply_markup=kb_admin_items())
+        return
+    q = "UPDATE items SET " + ", ".join(updates) + " WHERE id=?"
+    params.append(iid)
+    db_exec(q, tuple(params))
+    await state.clear()
+    await msg.answer("✅ Товар обновлён.", reply_markup=kb_admin_items())
+
+@dp.callback_query(F.data == "admin_del")
+async def admin_del_start(cb: types.CallbackQuery, state: FSMContext):
+    if not ensure_admin(cb): return
+    await state.set_state(DelItem.id)
+    await cb.message.edit_text("🗑 Введите ID товара для удаления:", reply_markup=kb_back_main())
+
+@dp.message(DelItem.id)
+async def admin_del_id(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    try:
+        iid = int(msg.text.strip())
+    except:
+        await msg.answer("ID - число.")
+        return
+    row = db_one("SELECT name FROM items WHERE id=?", (iid,))
+    if not row:
+        await msg.answer("Товар не найден.")
+        return
+    db_exec("DELETE FROM items WHERE id=?", (iid,))
+    await state.clear()
+    await msg.answer(f"🗑 Удалён товар '{row[0]}'.", reply_markup=kb_admin_items())
+
+@dp.callback_query(F.data == "admin_list")
+async def admin_list_items(cb: types.CallbackQuery):
+    if not ensure_admin(cb):
+        return
+    rows = db_all("SELECT id, name, price FROM items ORDER BY id")
+    if not rows:
+        await cb.message.edit_text("📋 Товаров нет.", reply_markup=kb_admin_items())
+        return
+    lines = ["📋 <b>Товары</b>:"]
+    for iid, name, price in rows:
+        lines.append(f"#{iid}: {name} — {price} оч.")
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_items())
+
+# --- Крипто-админ
+@dp.callback_query(F.data == "cadmin_add")
+async def cadmin_add_start(cb: types.CallbackQuery, state: FSMContext):
+    if not ensure_admin(cb): return
+    await state.set_state(CAdd.name)
+    await cb.message.edit_text("➕ Введите название товара (USDT):", reply_markup=kb_back_main())
+
+@dp.message(CAdd.name)
+async def cadmin_add_name(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    name = msg.text.strip()
+    if not name:
+        await msg.answer("Название не может быть пустым.")
+        return
+    await state.update_data(name=name)
+    await state.set_state(CAdd.price)
+    await msg.answer("Цена в USDT (float >0):", reply_markup=kb_back_main())
+
+@dp.message(CAdd.price)
+async def cadmin_add_price(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    try:
+        price = float(msg.text.strip())
+        if price <= 0:
+            raise ValueError
+    except:
+        await msg.answer("Цена - число >0.")
+        return
+    data = await state.get_data()
+    db_exec("INSERT INTO crypto_items (name, price_usdt) VALUES (?, ?)", (data["name"], price))
+    await state.clear()
+    await msg.answer("✅ Товар добавлен.", reply_markup=kb_admin_cshop())
+
+@dp.callback_query(F.data == "cadmin_edit")
+async def cadmin_edit_start(cb: types.CallbackQuery, state: FSMContext):
+    if not ensure_admin(cb): return
+    await state.set_state(CEdit.id)
+    await cb.message.edit_text("✏ Введите ID товара (USDT):", reply_markup=kb_back_main())
+
+@dp.message(CEdit.id)
+async def cadmin_edit_id(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    try:
+        iid = int(msg.text.strip())
+    except:
+        await msg.answer("ID - число.")
+        return
+    if not db_one("SELECT 1 FROM crypto_items WHERE id=?", (iid,)):
+        await msg.answer("Товар не найден.")
+        return
+    await state.update_data(id=iid)
+    await state.set_state(CEdit.name)
+    await msg.answer("Новое название (или . пропуск):", reply_markup=kb_back_main())
+
+@dp.message(CEdit.name)
+async def cadmin_edit_name(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    name = msg.text.strip()
+    await state.update_data(name=None if name == '.' else name)
+    await state.set_state(CEdit.price)
+    await msg.answer("Новая цена (или . пропуск):", reply_markup=kb_back_main())
+
+@dp.message(CEdit.price)
+async def cadmin_edit_price(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    txt = msg.text.strip()
+    price = None
+    if txt != '.':
+        try:
+            price = float(txt)
+            if price <= 0:
+                raise ValueError
+        except:
+            await msg.answer("Цена - число >0.")
+            return
+    data = await state.get_data()
+    iid = data["id"]
+    updates = []
+    params = []
+    if data["name"] is not None:
+        updates.append("name=?")
+        params.append(data["name"])
+    if price is not None:
+        updates.append("price_usdt=?")
+        params.append(price)
+    if not updates:
+        await state.clear()
+        await msg.answer("Ничего не изменено.", reply_markup=kb_admin_cshop())
+        return
+    q = "UPDATE crypto_items SET " + ", ".join(updates) + " WHERE id=?"
+    params.append(iid)
+    db_exec(q, tuple(params))
+    await state.clear()
+    await msg.answer("✅ Товар обновлён.", reply_markup=kb_admin_cshop())
+
+@dp.callback_query(F.data == "cadmin_del")
+async def cadmin_del_start(cb: types.CallbackQuery, state: FSMContext):
+    if not ensure_admin(cb): return
+    await state.set_state(CDel.id)
+    await cb.message.edit_text("🗑 Введите ID товара для удаления:", reply_markup=kb_back_main())
+
+@dp.message(CDel.id)
+async def cadmin_del_id(msg: types.Message, state: FSMContext):
+    if not ensure_admin(msg): return
+    try:
+        iid = int(msg.text.strip())
+    except:
+        await msg.answer("ID - число.")
+        return
+    row = db_one("SELECT name FROM crypto_items WHERE id=?", (iid,))
+    if not row:
+        await msg.answer("Товар не найден.")
+        return
+    db_exec("DELETE FROM crypto_items WHERE id=?", (iid,))
+    await state.clear()
+    await msg.answer(f"🗑 Удалён товар '{row[0]}'.", reply_markup=kb_admin_cshop())
+
+@dp.callback_query(F.data == "cadmin_list")
+async def cadmin_list_items(cb: types.CallbackQuery):
+    if not ensure_admin(cb):
+        return
+    rows = db_all("SELECT id, name, price_usdt FROM crypto_items ORDER BY id")
+    if not rows:
+        await cb.message.edit_text("📋 Товаров нет.", reply_markup=kb_admin_cshop())
+        return
+    lines = ["📋 <b>Крипто-товары</b>:"]
+    for iid, name, price in rows:
+        lines.append(f"#{iid}: {name} — {price:.2f} USDT")
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_cshop())
+
 # Обеспечение админ-доступа
 def ensure_admin(obj: types.CallbackQuery | types.Message) -> bool:
-    if isinstance(obj, types.CallbackQuery):
-        obj = obj.message
-    if obj.from_user.id not in ADMIN_IDS:
-        obj.answer("⛔ Нет доступа", show_alert=True)
+    user_id = obj.from_user.id if isinstance(obj, types.CallbackQuery) else obj.from_user.id
+    if user_id not in ADMIN_IDS:
+        if isinstance(obj, types.CallbackQuery):
+            obj.answer("⛔ Нет доступа", show_alert=True)
+        else:
+            obj.answer("⛔ Нет доступа")
         return False
     return True
+
+# Catch-all for unhandled callbacks
+@dp.callback_query()
+async def catch_all(callback: types.CallbackQuery):
+    logging.info(f"Unhandled callback: {callback.data}")
+    await callback.answer("Неизвестная команда", show_alert=True)
 
 async def main():
     asyncio.create_task(auto_check_crypto_orders())
