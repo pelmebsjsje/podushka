@@ -1163,78 +1163,69 @@ async def hatch_egg_cb(callback: types.CallbackQuery):
         await callback.answer("Яйцо ещё не готово.", show_alert=True)
         return
     await hatch_egg(he_id, uid)
+    await callback.answer("🥚 Яйцо вылуплено!")
     try:
         await callback.message.edit_text("🥚 Яйцо вылуплено!", reply_markup=kb_back_main())
     except TelegramBadRequest:
         await callback.message.answer("🥚 Яйцо вылуплено!", reply_markup=kb_back_main())
+
+async def hatch_egg(he_id: int, uid: int):
+    egg_row = db_one("SELECT egg_id FROM hatching_eggs WHERE id=?", (he_id,))
+    egg_id = egg_row[0]
+    egg_name = db_one("SELECT name FROM egg_types WHERE id=?", (egg_id,))[0]
+    if egg_name == "Random Egg":
+        random_egg_id = db_one("SELECT id FROM egg_types WHERE name = 'Random Egg'")[0]
+        chances = db_all("SELECT egg_id, chance FROM egg_chances WHERE random_egg_id=?", (random_egg_id,))
+        if not chances:
+            await notify_user(uid, "Ошибка: Нет настроенных шансов для Random Egg.")
+            return
+        eggs = [e for e, ch in chances]
+        probs = [ch for e, ch in chances]
+        total_prob = sum(probs)
+        probs = [p / total_prob for p in probs]
+        chosen_egg_id = random.choices(eggs, probs)[0]
+        egg_id = chosen_egg_id
+    # Теперь выпадение питомца из egg_id
+    pet_chances = db_all("SELECT pet_id, chance FROM pet_egg_chances WHERE egg_id=?", (egg_id,))
+    if not pet_chances:
+        pet_chances = db_all("SELECT id, chance FROM pets_config")
+    if not pet_chances:
+        await notify_user(uid, "Ошибка: Нет питомцев для выпадения.")
+        return
+    pets = [p for p, ch in pet_chances]
+    probs = [ch for p, ch in pet_chances]
+    total_prob = sum(probs)
+    probs = [p / total_prob for p in probs]
+    pet_id = random.choices(pets, probs)[0]
+    db_exec("INSERT INTO user_pets (user_id, pet_id, egg_id) VALUES (?, ?, ?)", (uid, pet_id, egg_id))
+    pet_name = db_one("SELECT name FROM pets_config WHERE id=?", (pet_id,))[0]
+    await notify_user(uid, f"🎉 Из яйца '{egg_name}' вылупился '{pet_name}'!")
+    db_exec("DELETE FROM hatching_eggs WHERE id=?", (he_id,))
 
 @dp.callback_query(F.data.startswith("skip_hatch:"))
 async def skip_hatch_cb(callback: types.CallbackQuery):
     uid = callback.from_user.id
     parts = callback.data.split(":")
     he_id = int(parts[1])
-    row = db_one("SELECT egg_id, acquired_at FROM hatching_eggs WHERE id=? AND user_id=?", (he_id, uid))
-    if not row:
-        await callback.answer("Яйцо не найдено или не ваше.", show_alert=True)
-        return
-    user_points = db_one("SELECT points FROM users WHERE user_id=?", (uid,))[0] or 0.0
-    if user_points < SKIP_HATCH_COST:
-        await callback.answer("Недостаточно очков для пропуска.", show_alert=True)
+    row = db_one("SELECT points FROM users WHERE user_id=?", (uid,))
+    points = row[0] if row else 0.0
+    if points < SKIP_HATCH_COST:
+        await callback.answer("Недостаточно очков для пропуска!", show_alert=True)
         return
     db_exec("UPDATE users SET points = points - ? WHERE user_id=?", (SKIP_HATCH_COST, uid))
     await hatch_egg(he_id, uid)
+    await callback.answer("🥚 Вылупление пропущено!")
     try:
-        await callback.message.edit_text("🥚 Яйцо вылуплено (пропуск за 25 очков)!", reply_markup=kb_back_main())
+        await callback.message.edit_text("🥚 Вылупление пропущено!", reply_markup=kb_back_main())
     except TelegramBadRequest:
-        await callback.message.answer("🥚 Яйцо вылуплено (пропуск за 25 очков)!", reply_markup=kb_back_main())
-
-async def hatch_egg(he_id: int, uid: int):
-    egg_id = db_one("SELECT egg_id FROM hatching_eggs WHERE id=?", (he_id,))[0]
-    # Проверка на Random Egg
-    random_egg_id = db_one("SELECT id FROM egg_types WHERE name='Random Egg'")[0]
-    if egg_id == random_egg_id:
-        chances = db_all("SELECT egg_id, chance FROM egg_chances WHERE random_egg_id=?", (egg_id,))
-        if chances:
-            egg_ids = [row[0] for row in chances]
-            egg_chances = [row[1] for row in chances]
-            sum_ch = sum(egg_chances)
-            if sum_ch > 0:
-                rolled_egg_id = random.choices(egg_ids, weights=egg_chances)[0]
-                rolled_name = db_one("SELECT name FROM egg_types WHERE id=?", (rolled_egg_id,))[0]
-                await notify_user(uid, f"🥚 Ваше Random Egg вылупилось в {rolled_name}!")
-                egg_id = rolled_egg_id  # Теперь вылупляем из rolled_egg_id
-
-    # Выбор питомца по pet_egg_chances
-    pet_rows = db_all("SELECT pet_id, chance FROM pet_egg_chances WHERE egg_id=?", (egg_id,))
-    if not pet_rows:
-        # Fallback: использовать все питомцы из pets_config с их chance
-        pet_rows = db_all("SELECT id, chance FROM pets_config")
-        if not pet_rows:
-            await notify_user(uid, "❗ Нет настроенных питомцев.")
-            return
-
-    pet_ids = [row[0] for row in pet_rows]
-    pet_chances = [row[1] for row in pet_rows]
-    sum_pch = sum(pet_chances)
-    if sum_pch <= 0:
-        pet_id = random.choice(pet_ids)
-    else:
-        pet_id = random.choices(pet_ids, weights=pet_chances)[0]
-    acquired_at = db_one("SELECT acquired_at FROM hatching_eggs WHERE id=?", (he_id,))[0]
-    db_exec("INSERT INTO user_pets (user_id, pet_id, egg_id, acquired_at) VALUES (?, ?, ?, ?)", (uid, pet_id, egg_id, acquired_at))
-    db_exec("DELETE FROM hatching_eggs WHERE id=?", (he_id,))
-    pet_row = db_one("SELECT name, daily_points FROM pets_config WHERE id=?", (pet_id,))
-    rar_row = db_one("SELECT r.name FROM pets_config p JOIN rarities r ON p.rarity_id = r.id WHERE p.id=?", (pet_id,))
-    rar_name = rar_row[0] if rar_row else "Unknown"
-    pet_name, daily_points = pet_row
-    await notify_user(uid, f"🥚 Вылупился питомец '{pet_name}' ({rar_name})! +{daily_points:.2f} оч./день")
+        await callback.message.answer("🥚 Вылупление пропущено!", reply_markup=kb_back_main())
 
 # ========= МОИ ПИТОМЦЫ =========
 @dp.callback_query(F.data == "my_pets")
-async def my_pets_cb(callback: types.CallbackQuery):
+async def my_pets(callback: types.CallbackQuery):
     uid = callback.from_user.id
     pets = db_all("""
-        SELECT up.id, up.pet_id, up.acquired_at, up.lives, up.last_feed_day, up.feed_streak
+        SELECT up.id, up.pet_id, up.acquired_at, up.lives
         FROM user_pets up
         WHERE up.user_id = ?
     """, (uid,))
@@ -1245,12 +1236,9 @@ async def my_pets_cb(callback: types.CallbackQuery):
             await callback.message.answer("🐾 У вас нет питомцев.", reply_markup=kb_back_main())
         return
     lines = ["🐾 <b>Мои питомцы</b>:"]
-    now_day = int(time.time() // 86400)
-    for up_id, pet_id, acquired_at, lives, last_day, streak in pets:
-        name, photo, dp = get_pet_current_stage(pet_id, acquired_at, lives)
-        fed_today = last_day == now_day
-        status = "💀 Мёртв" if lives <= 0 else f"❤️ {lives}/10" + (f" | Кормлен сегодня" if fed_today else " | Голодный")
-        lines.append(f"{name} | {dp:.2f} оч./день | Стрик: {streak} | {status}")
+    for up_id, pet_id, acquired_at, lives in pets:
+        name, photo, daily = get_pet_current_stage(pet_id, acquired_at, lives)
+        lines.append(f"#{up_id}: {name} ({daily:.2f} оч./день) — жизней: {lives}")
     try:
         await callback.message.edit_text("\n".join(lines), reply_markup=kb_my_pets(uid))
     except TelegramBadRequest:
@@ -1261,89 +1249,92 @@ async def pet_profile_cb(callback: types.CallbackQuery):
     uid = callback.from_user.id
     parts = callback.data.split(":")
     up_id = int(parts[1])
-    row = db_one("SELECT pet_id, acquired_at, lives, last_feed_day, feed_streak FROM user_pets WHERE id=? AND user_id=?", (up_id, uid))
+    row = db_one("""
+        SELECT up.pet_id, up.acquired_at, up.lives, up.last_feed_day, up.feed_streak, up.egg_id
+        FROM user_pets up
+        WHERE up.id=? AND up.user_id=?
+    """, (up_id, uid))
     if not row:
         await callback.answer("Питомец не найден или не ваш.", show_alert=True)
         return
-    pet_id, acquired_at, lives, last_day, streak = row
-    name, photo, dp = get_pet_current_stage(pet_id, acquired_at, lives)
-    rar_row = db_one("SELECT r.name FROM pets_config p JOIN rarities r ON p.rarity_id = r.id WHERE p.id=?", (pet_id,))
-    rar_name = rar_row[0] if rar_row else "Unknown"
+    pet_id, acquired_at, lives, last_feed_day, streak, egg_id = row
+    name, photo, daily = get_pet_current_stage(pet_id, acquired_at, lives)
+    egg_name = db_one("SELECT name FROM egg_types WHERE id=?", (egg_id,))[0] if egg_id else "Выдан админом"
     now_day = int(time.time() // 86400)
-    fed_today = last_day == now_day
-    status = "💀 Мёртв" if lives <= 0 else f"❤️ {lives}/10" + (f" | Кормлен" if fed_today else " | Голодный")
-    text = f"🐶 <b>{name}</b> ({rar_name})\n" \
-           f"Ежедневно: {dp:.2f} оч.\n" \
-           f"Стрик кормления: {streak}\n" \
-           f"Статус: {status}"
+    fed_today = last_feed_day == now_day
+    text = f"🐶 <b>{name}</b>\n" \
+           f"Из яйца: {egg_name}\n" \
+           f"Очки в день: {daily:.2f}\n" \
+           f"Жизней: {lives}/10\n" \
+           f"Стрик кормлений: {streak}\n" \
+           f"{'Уже покормлен сегодня.' if fed_today else 'Можно покормить.'}"
+    kb = kb_pet_profile(up_id)
     if photo:
         try:
-            await callback.message.edit_caption(caption=text, reply_markup=kb_pet_profile(up_id))
-        except:
             await callback.message.delete()
-            await callback.message.answer_photo(photo, caption=text, reply_markup=kb_pet_profile(up_id))
+            await callback.message.answer_photo(photo=photo, caption=text, reply_markup=kb)
+        except:
+            await callback.message.edit_text(text + "\n(Фото не удалось показать)", reply_markup=kb)
     else:
         try:
-            await callback.message.edit_text(text, reply_markup=kb_pet_profile(up_id))
+            await callback.message.edit_text(text, reply_markup=kb)
         except TelegramBadRequest:
-            await callback.message.answer(text, reply_markup=kb_pet_profile(up_id))
+            await callback.message.answer(text, reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("feed:"))
 async def feed_pet_cb(callback: types.CallbackQuery):
     uid = callback.from_user.id
     parts = callback.data.split(":")
     up_id = int(parts[1])
-    row = db_one("SELECT lives, last_feed_day FROM user_pets WHERE id=? AND user_id=?", (up_id, uid))
+    row = db_one("SELECT last_feed_day, feed_streak, lives FROM user_pets WHERE id=? AND user_id=?", (up_id, uid))
     if not row:
-        await callback.answer("Питомец не найден или не ваш.", show_alert=True)
+        await callback.answer("Питомец не найден.", show_alert=True)
         return
-    lives, last_day = row
+    last_day, streak, lives = row
     if lives <= 0:
         await callback.answer("Питомец мёртв.", show_alert=True)
         return
     now_day = int(time.time() // 86400)
     if last_day == now_day:
-        await callback.answer("Уже кормили сегодня.", show_alert=True)
+        await callback.answer("Уже покормлен сегодня.", show_alert=True)
         return
-    new_streak = db_one("SELECT feed_streak FROM user_pets WHERE id=?", (up_id,))[0] + 1 if last_day == now_day - 1 else 1
-    db_exec("UPDATE user_pets SET last_feed_day=?, feed_streak=? WHERE id=?", (now_day, new_streak, up_id))
-    await callback.answer("🍖 Питомец покормлен!")
-    await pet_profile_cb(callback)  # Обновить профиль
+    new_streak = streak + 1 if last_day == now_day - 1 else 1
+    new_lives = min(10, lives + (1 if new_streak % 5 == 0 else 0))
+    db_exec("UPDATE user_pets SET last_feed_day=?, feed_streak=?, lives=? WHERE id=?", (now_day, new_streak, new_lives, up_id))
+    bonus = " +1 жизнь!" if new_streak % 5 == 0 else ""
+    await callback.answer(f"🍖 Покормлен! Стрик: {new_streak}{bonus}")
 
 @dp.callback_query(F.data.startswith("delete_pet:"))
 async def delete_pet_cb(callback: types.CallbackQuery):
     uid = callback.from_user.id
     parts = callback.data.split(":")
     up_id = int(parts[1])
-    row = db_one("SELECT pet_id FROM user_pets WHERE id=? AND user_id=?", (up_id, uid))
-    if not row:
-        await callback.answer("Питомец не найден или не ваш.", show_alert=True)
+    if not db_one("SELECT 1 FROM user_pets WHERE id=? AND user_id=?", (up_id, uid)):
+        await callback.answer("Питомец не найден.", show_alert=True)
         return
-    pet_name = db_one("SELECT name FROM pets_config WHERE id=?", (row[0],))[0]
     db_exec("DELETE FROM user_pets WHERE id=?", (up_id,))
-    try:
-        await callback.message.edit_text(f"🗑 Питомец '{pet_name}' удалён.", reply_markup=kb_back_main())
-    except TelegramBadRequest:
-        await callback.message.answer(f"🗑 Питомец '{pet_name}' удалён.", reply_markup=kb_back_main())
+    await callback.answer("🗑 Питомец удалён.")
+    await my_pets(callback)
 
 @dp.callback_query(F.data.startswith("transfer_pet:"))
-async def transfer_pet_start(cb: types.CallbackQuery, state: FSMContext):
-    uid = cb.from_user.id
-    parts = cb.data.split(":")
+async def transfer_pet_start(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    parts = callback.data.split(":")
     up_id = int(parts[1])
     if not db_one("SELECT 1 FROM user_pets WHERE id=? AND user_id=?", (up_id, uid)):
-        await cb.answer("Питомец не найден или не ваш.", show_alert=True)
+        await callback.answer("Питомец не найден.", show_alert=True)
         return
-    await state.update_data(up_id=up_id)
+    await state.update_data(pet_up_id=up_id)
     await state.set_state(TransferPet.target)
     try:
-        await cb.message.edit_text("🔄 Введите user_id получателя:", reply_markup=kb_back_main())
+        await callback.message.edit_text("🔄 Введите user_id получателя:", reply_markup=kb_back_main())
     except TelegramBadRequest:
-        await cb.message.answer("🔄 Введите user_id получателя:", reply_markup=kb_back_main())
+        await callback.message.answer("🔄 Введите user_id получателя:", reply_markup=kb_back_main())
 
 @dp.message(TransferPet.target)
 async def transfer_pet_target(msg: types.Message, state: FSMContext):
-    if msg.from_user.id != msg.from_user.id: return  # Dummy
+    if msg.from_user.id != msg.from_user.id:  # Dummy, but to ensure
+        return
     try:
         target_uid = int(msg.text.strip())
     except:
@@ -1353,62 +1344,28 @@ async def transfer_pet_target(msg: types.Message, state: FSMContext):
         await msg.answer("Получатель не найден.")
         return
     data = await state.get_data()
-    up_id = data["up_id"]
-    pet_name = db_one("""
-        SELECT p.name FROM user_pets up JOIN pets_config p ON up.pet_id = p.id WHERE up.id=?
-    """, (up_id,))[0]
+    up_id = data["pet_up_id"]
     db_exec("UPDATE user_pets SET user_id=? WHERE id=?", (target_uid, up_id))
-    await notify_user(target_uid, f"🔄 Получен питомец '{pet_name}' от {display_name(msg.from_user.id)}!")
+    pet_name = db_one("""
+        SELECT p.name FROM pets_config p
+        JOIN user_pets up ON up.pet_id = p.id
+        WHERE up.id = ?
+    """, (up_id,))[0]
+    await notify_user(target_uid, f"🎁 Вы получили питомца '{pet_name}' от {display_name(msg.from_user.id)}!")
     await state.clear()
     await msg.answer("✅ Питомец передан.", reply_markup=kb_back_main())
 
-# ========= АДМИН: МЕНЮ =========
+# ========= АДМИН =========
 @dp.callback_query(F.data == "admin_menu")
-async def admin_menu_cb(callback: types.CallbackQuery):
-    logging.info(f"Admin menu called by user {callback.from_user.id}")
-    if callback.from_user.id not in ADMIN_IDS:
+async def admin_menu_cb(callback: types.CallbackQuery, state: FSMContext):
+    if not ensure_admin(callback):
         await callback.answer("⛔ Нет доступа", show_alert=True)
-        logging.warning(f"Access denied for {callback.from_user.id}")
         return
+    await state.clear()
     try:
-        await callback.message.edit_text("⚙ Админ-панель", reply_markup=kb_admin())
-    except TelegramBadRequest as e:
-        logging.error(f"Edit failed: {e}")
-        await callback.message.answer("⚙ Админ-панель", reply_markup=kb_admin())  # Fallback
-
-@dp.callback_query(F.data == "admin_items")
-async def admin_items_cb(callback: types.CallbackQuery):
-    if not ensure_admin(callback):
-        return
-    try:
-        await callback.message.edit_text("🛍 Управление товарами", reply_markup=kb_admin_items())
+        await callback.message.edit_text("⚙ <b>Админ-панель</b>", reply_markup=kb_admin())
     except TelegramBadRequest:
-        await callback.message.answer("🛍 Управление товарами", reply_markup=kb_admin_items())
-
-@dp.callback_query(F.data == "admin_cshop")
-async def admin_cshop_cb(callback: types.CallbackQuery):
-    if not ensure_admin(callback):
-        return
-    try:
-        await callback.message.edit_text("💱 Управление крипто-магазином", reply_markup=kb_admin_cshop())
-    except TelegramBadRequest:
-        await callback.message.answer("💱 Управление крипто-магазином", reply_markup=kb_admin_cshop())
-
-@dp.callback_query(F.data == "admin_orders")
-async def admin_orders_cb(callback: types.CallbackQuery):
-    if not ensure_admin(callback):
-        return
-    orders = db_all("""
-        SELECT id, user_id, item_name, price, status, created_at
-        FROM orders
-        ORDER BY created_at DESC
-        LIMIT 50
-    """)
-    text = "📦 <b>Заказы (последние 50)</b>:\n" + format_orders_list_with_names(orders)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb_admin())
-    except TelegramBadRequest:
-        await callback.message.answer(text, reply_markup=kb_admin())
+        await callback.message.answer("⚙ <b>Админ-панель</b>", reply_markup=kb_admin())
 
 @dp.callback_query(F.data.startswith("order:"))
 async def order_status_cb(callback: types.CallbackQuery):
@@ -1416,8 +1373,6 @@ async def order_status_cb(callback: types.CallbackQuery):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     parts = callback.data.split(":")
-    if len(parts) != 3:
-        return
     order_id = int(parts[1])
     new_status = parts[2]
     row = db_one("SELECT user_id, item_name, status FROM orders WHERE id=?", (order_id,))
@@ -1426,17 +1381,32 @@ async def order_status_cb(callback: types.CallbackQuery):
         return
     uid, item_name, old_status = row
     if old_status == new_status:
-        await callback.answer("Статус уже такой.", show_alert=True)
+        await callback.answer("Статус не изменился.")
         return
     db_exec("UPDATE orders SET status=? WHERE id=?", (new_status, order_id))
     human = {"processing": "в обработке", "done": "выполнен", "canceled": "отменён"}.get(new_status, new_status)
     await notify_user(uid, f"🧾 Заказ #{order_id} ({item_name}) теперь <i>{human}</i>.")
     await callback.answer(f"Статус изменён на {human}.")
-    # Обновить сообщение админа
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except:
         pass
+
+@dp.callback_query(F.data == "admin_orders")
+async def admin_orders_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        return
+    rows = db_all("""
+        SELECT id, user_id, item_name, price, status, created_at
+        FROM orders
+        ORDER BY created_at DESC
+        LIMIT 50
+    """)
+    text = "🧾 <b>Заказы (последние 50)</b>:\n" + format_orders_list_with_names(rows)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb_admin())
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=kb_admin())
 
 @dp.callback_query(F.data == "admin_give_points")
 async def admin_give_points_start(cb: types.CallbackQuery, state: FSMContext):
@@ -1460,10 +1430,10 @@ async def admin_give_points_uid(msg: types.Message, state: FSMContext):
         return
     await state.update_data(user_id=uid)
     await state.set_state(GivePoints.amount)
-    await msg.answer("Количество очков (float, может быть отриц.):", reply_markup=kb_back_main())
+    await msg.answer("Количество очков (float, может быть отрицательным):", reply_markup=kb_back_main())
 
 @dp.message(GivePoints.amount)
-async def admin_give_points_amt(msg: types.Message, state: FSMContext):
+async def admin_give_points_amount(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     try:
         amt = float(msg.text.strip())
@@ -1474,84 +1444,78 @@ async def admin_give_points_amt(msg: types.Message, state: FSMContext):
     uid = data["user_id"]
     db_exec("UPDATE users SET points = points + ? WHERE user_id=?", (amt, uid))
     sign = "+" if amt > 0 else ""
-    await notify_user(uid, f"➕ Админ выдал {sign}{amt:.2f} очков!")
+    await notify_user(uid, f"📊 Админ выдал {sign}{amt:.2f} очков.")
     await state.clear()
-    await msg.answer(f"✅ Выдано {amt:.2f} очков пользователю {display_name(uid)}.", reply_markup=kb_admin())
+    await msg.answer("✅ Очки выданы.", reply_markup=kb_admin())
 
 @dp.callback_query(F.data.startswith("admin_users:"))
 async def admin_users_cb(callback: types.CallbackQuery):
-    if not ensure_admin(callback): return
+    if not ensure_admin(callback):
+        return
     parts = callback.data.split(":")
     page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     total = db_one("SELECT COUNT(*) FROM users")[0]
     total_pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     offset = page * USERS_PAGE_SIZE
-    users = db_all("""
-        SELECT user_id, points, created_at
+    rows = db_all("""
+        SELECT user_id, points, created_at, referrer_id
         FROM users
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
     """, (USERS_PAGE_SIZE, offset))
-    lines = [f"👥 <b>Пользователи (страница {page+1}/{total_pages})</b>:"]
-    for uid, pts, ts in users:
+    lines = [f"👥 <b>Пользователи</b> (страница {page+1}/{total_pages}):"]
+    for uid, pts, ts, ref_id in rows:
         t = time.strftime("%d.%m %H:%M", time.localtime(ts))
-        lines.append(f"{display_name(uid)} / {uid} — {pts:.2f} оч. ({t})")
+        ref = f" от {display_name(ref_id)}" if ref_id else ""
+        lines.append(f"{display_name(uid)} / {uid} — {pts:.2f} оч. • {t}{ref}")
+    text = "\n".join(lines)
+    kb = kb_users_pagination(page, total_pages)
     try:
-        await callback.message.edit_text("\n".join(lines), reply_markup=kb_users_pagination(page, total_pages))
+        await callback.message.edit_text(text, reply_markup=kb)
     except TelegramBadRequest:
-        await callback.message.answer("\n".join(lines), reply_markup=kb_users_pagination(page, total_pages))
+        await callback.message.answer(text, reply_markup=kb)
 
 @dp.callback_query(F.data == "admin_export_users")
-async def admin_export_users(cb: types.CallbackQuery):
-    if not ensure_admin(cb): return
+async def admin_export_users_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        return
     rows = db_all("""
-        SELECT user_id, username, full_name, points, created_at
+        SELECT user_id, username, full_name, points, created_at, referrer_id
         FROM users
         ORDER BY created_at DESC
     """)
-    path = "users.csv"
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["user_id", "username", "full_name", "points", "created_at"])
+    csv_path = "users_export.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["user_id", "username", "full_name", "points", "created_at", "referrer_id"])
         for row in rows:
-            row = list(row)
-            row[4] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[4]))
-            w.writerow(row)
-    await cb.message.answer_document(FSInputFile(path))
-    os.remove(path)
+            writer.writerow(row)
+    await callback.message.answer_document(FSInputFile(csv_path))
+    os.remove(csv_path)
 
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(cb: types.CallbackQuery, state: FSMContext):
     if not ensure_admin(cb): return
     await state.set_state(Broadcast.content)
     try:
-        await cb.message.edit_text("📢 Введите текст рассылки (или отправьте фото/видео/документ/аудио/войс с подписью):", reply_markup=kb_back_main())
+        await cb.message.edit_text("📢 Введите текст рассылки (или отправьте фото с подписью):", reply_markup=kb_back_main())
     except TelegramBadRequest:
-        await cb.message.answer("📢 Введите текст рассылки (или отправьте фото/видео/документ/аудио/войс с подписью):", reply_markup=kb_back_main())
+        await cb.message.answer("📢 Введите текст рассылки (или отправьте фото с подписью):", reply_markup=kb_back_main())
 
 @dp.message(Broadcast.content)
 async def admin_broadcast_content(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
-    content = msg.html_text or msg.caption_html
-    media_type = None
-    file_id = None
     if msg.photo:
-        media_type = 'photo'
-        file_id = msg.photo[-1].file_id
-    elif msg.video:
-        media_type = 'video'
-        file_id = msg.video.file_id
-    elif msg.document:
-        media_type = 'document'
-        file_id = msg.document.file_id
-    elif msg.audio:
-        media_type = 'audio'
-        file_id = msg.audio.file_id
-    elif msg.voice:
-        media_type = 'voice'
-        file_id = msg.voice.file_id
-    await state.update_data(content=content, media_type=media_type, file_id=file_id)
+        photo = msg.photo[-1].file_id
+        caption = msg.caption or ""
+        await state.update_data(photo=photo, caption=caption)
+    else:
+        text = msg.text or msg.caption
+        if not text:
+            await msg.answer("Текст или фото обязательно.")
+            return
+        await state.update_data(text=text)
     await state.set_state(Broadcast.btn_choice)
     await msg.answer("Добавить кнопку? (да/нет):", reply_markup=kb_back_main())
 
@@ -1559,19 +1523,20 @@ async def admin_broadcast_content(msg: types.Message, state: FSMContext):
 async def admin_broadcast_btn_choice(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     choice = msg.text.strip().lower()
-    if choice == 'да':
-        await state.set_state(Broadcast.btn_text)
-        await msg.answer("Текст кнопки:", reply_markup=kb_back_main())
-    else:
+    if choice not in ("да", "yes", "y"):
+        await state.update_data(btn_text=None, btn_url=None)
         await state.set_state(Broadcast.confirm)
-        await msg.answer("Подтвердить рассылку? (да/нет):", reply_markup=kb_back_main())
+        await msg.answer("Подтвердите рассылку (да/нет):", reply_markup=kb_back_main())
+        return
+    await state.set_state(Broadcast.btn_text)
+    await msg.answer("Текст кнопки:", reply_markup=kb_back_main())
 
 @dp.message(Broadcast.btn_text)
 async def admin_broadcast_btn_text(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     btn_text = msg.text.strip()
     if not btn_text:
-        await msg.answer("Текст не может быть пустым.")
+        await msg.answer("Текст кнопки не может быть пустым.")
         return
     await state.update_data(btn_text=btn_text)
     await state.set_state(Broadcast.btn_url)
@@ -1582,107 +1547,82 @@ async def admin_broadcast_btn_url(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     btn_url = msg.text.strip()
     if not btn_url.startswith("http"):
-        await msg.answer("URL должен начинаться с http.")
+        await msg.answer("URL должен начинаться с http(s).")
         return
     await state.update_data(btn_url=btn_url)
     await state.set_state(Broadcast.confirm)
-    await msg.answer("Подтвердить рассылку? (да/нет):", reply_markup=kb_back_main())
+    await msg.answer("Подтвердите рассылку (да/нет):", reply_markup=kb_back_main())
 
 @dp.message(Broadcast.confirm)
 async def admin_broadcast_confirm(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     choice = msg.text.strip().lower()
-    if choice != 'да':
+    if choice not in ("да", "yes", "y"):
         await state.clear()
         await msg.answer("Рассылка отменена.", reply_markup=kb_admin())
         return
     data = await state.get_data()
-    content = data["content"]
     btn_text = data.get("btn_text")
     btn_url = data.get("btn_url")
-    media_type = data.get("media_type")
-    file_id = data.get("file_id")
     kb = None
     if btn_text and btn_url:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, url=btn_url)]])
     users = [row[0] for row in db_all("SELECT user_id FROM users")]
     sent = 0
-    last_ts = 0
     for uid in users:
-        now = time.time()
-        if now - last_ts < BROADCAST_COOLDOWN_SEC / len(users):  # Чтобы не спамить API
-            await asyncio.sleep((BROADCAST_COOLDOWN_SEC / len(users)) - (now - last_ts))
-        last_ts = time.time()
         try:
-            if media_type:
-                if media_type == 'photo':
-                    await bot.send_photo(uid, file_id, caption=content, reply_markup=kb)
-                elif media_type == 'video':
-                    await bot.send_video(uid, file_id, caption=content, reply_markup=kb)
-                elif media_type == 'document':
-                    await bot.send_document(uid, file_id, caption=content, reply_markup=kb)
-                elif media_type == 'audio':
-                    await bot.send_audio(uid, file_id, caption=content, reply_markup=kb)
-                elif media_type == 'voice':
-                    await bot.send_voice(uid, file_id, caption=content, reply_markup=kb)
+            if "photo" in data:
+                await bot.send_photo(uid, data["photo"], caption=data.get("caption"), reply_markup=kb)
             else:
-                await bot.send_message(uid, content, reply_markup=kb)
+                await bot.send_message(uid, data["text"], reply_markup=kb)
             sent += 1
+            await asyncio.sleep(BROADCAST_COOLDOWN_SEC / len(users))  # Чтобы не спамить
         except Exception:
             pass
     await state.clear()
-    await msg.answer(f"✅ Рассылка завершена. Отправлено {sent} пользователям.", reply_markup=kb_admin())
+    await msg.answer(f"✅ Рассылка отправлена {sent} пользователям.", reply_markup=kb_admin())
 
-# --- Админ: Экспорт заказов
 @dp.callback_query(F.data == "admin_export")
-async def admin_export(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
+async def admin_export_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
         return
     rows = db_all("""
-        SELECT id, user_id, item_name, price, status, created_at
+        SELECT id, user_id, item_id, item_name, price, status, created_at
         FROM orders
         ORDER BY created_at DESC
     """)
-    path = "orders.csv"
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["id", "user_id", "item_name", "price", "status", "created_at"])
+    csv_path = "orders_export.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "user_id", "item_id", "item_name", "price", "status", "created_at"])
         for row in rows:
-            row = list(row)
-            row[5] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row[5]))
-            w.writerow(row)
-    await cb.message.answer_document(FSInputFile(path))
-    os.remove(path)
+            writer.writerow(row)
+    await callback.message.answer_document(FSInputFile(csv_path))
+    os.remove(csv_path)
 
-# --- Админ: Каналы подписки
+# --- Админ: Каналы
 @dp.callback_query(F.data == "admin_channels")
-async def admin_channels(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
+async def admin_channels_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     try:
-        await cb.message.edit_text("📢 Управление каналами подписки", reply_markup=kb_admin_channels())
+        await callback.message.edit_text("📢 Управление каналами подписки", reply_markup=kb_admin_channels())
     except TelegramBadRequest:
-        await cb.message.answer("📢 Управление каналами подписки", reply_markup=kb_admin_channels())
+        await callback.message.answer("📢 Управление каналами подписки", reply_markup=kb_admin_channels())
 
 @dp.callback_query(F.data == "admin_list_channels")
-async def admin_list_channels(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
+async def admin_list_channels_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     channels = get_channels()
-    if not channels:
-        try:
-            await cb.message.edit_text("📋 Каналов нет.", reply_markup=kb_admin_channels())
-        except TelegramBadRequest:
-            await cb.message.answer("📋 Каналов нет.", reply_markup=kb_admin_channels())
-        return
-    lines = ["📋 <b>Каналы</b>:"]
-    for ch in channels:
-        lines.append(f"• {ch}")
-    lines.append(f"\nОбязательность: {'да' if is_require_sub() else 'нет'}")
+    req = "обязательна" if is_require_sub() else "необязательна"
+    text = f"📋 <b>Каналы</b> (подписка {req}):\n" + "\n".join(channels) if channels else "Каналов нет."
     try:
-        await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_channels())
+        await callback.message.edit_text(text, reply_markup=kb_admin_channels())
     except TelegramBadRequest:
-        await cb.message.answer("\n".join(lines), reply_markup=kb_admin_channels())
+        await callback.message.answer(text, reply_markup=kb_admin_channels())
 
 @dp.callback_query(F.data == "admin_add_channel")
 async def admin_add_channel_start(cb: types.CallbackQuery, state: FSMContext):
@@ -1700,7 +1640,10 @@ async def admin_add_channel_ch(msg: types.Message, state: FSMContext):
     if not ch.startswith("@"):
         await msg.answer("@канал должен начинаться с @.")
         return
-    db_exec("INSERT OR IGNORE INTO channels (channel) VALUES (?)", (ch,))
+    if db_one("SELECT 1 FROM channels WHERE channel=?", (ch,)):
+        await msg.answer("Канал уже добавлен.")
+        return
+    db_exec("INSERT INTO channels (channel) VALUES (?)", (ch,))
     await state.clear()
     await msg.answer("✅ Канал добавлен.", reply_markup=kb_admin_channels())
 
@@ -1717,6 +1660,9 @@ async def admin_edit_channel_start(cb: types.CallbackQuery, state: FSMContext):
 async def admin_edit_channel_old(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     old_ch = msg.text.strip()
+    if not old_ch.startswith("@"):
+        await msg.answer("@канал должен начинаться с @.")
+        return
     if not db_one("SELECT 1 FROM channels WHERE channel=?", (old_ch,)):
         await msg.answer("Канал не найден.")
         return
@@ -1732,9 +1678,10 @@ async def admin_edit_channel_new(msg: types.Message, state: FSMContext):
         await msg.answer("@канал должен начинаться с @.")
         return
     data = await state.get_data()
-    db_exec("UPDATE channels SET channel=? WHERE channel=?", (new_ch, data["old_channel"]))
+    old_ch = data["old_channel"]
+    db_exec("UPDATE channels SET channel=? WHERE channel=?", (new_ch, old_ch))
     await state.clear()
-    await msg.answer("✅ Канал изменён.", reply_markup=kb_admin_channels())
+    await msg.answer("✅ Канал обновлён.", reply_markup=kb_admin_channels())
 
 @dp.callback_query(F.data == "admin_del_channel")
 async def admin_del_channel_start(cb: types.CallbackQuery, state: FSMContext):
@@ -1749,6 +1696,9 @@ async def admin_del_channel_start(cb: types.CallbackQuery, state: FSMContext):
 async def admin_del_channel_ch(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
     ch = msg.text.strip()
+    if not ch.startswith("@"):
+        await msg.answer("@канал должен начинаться с @.")
+        return
     if not db_one("SELECT 1 FROM channels WHERE channel=?", (ch,)):
         await msg.answer("Канал не найден.")
         return
@@ -1757,45 +1707,47 @@ async def admin_del_channel_ch(msg: types.Message, state: FSMContext):
     await msg.answer("🗑 Канал удалён.", reply_markup=kb_admin_channels())
 
 @dp.callback_query(F.data == "admin_toggle_sub")
-async def admin_toggle_sub(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
+async def admin_toggle_sub_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     current = is_require_sub()
-    new = '0' if current else '1'
-    db_exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('require_sub', ?)", (new,))
-    await cb.answer(f"Обязательность подписки: {'отключена' if new == '0' else 'включена'}")
-    await admin_list_channels(cb)
+    new_val = '0' if current else '1'
+    db_exec("INSERT OR REPLACE INTO meta (key, value) VALUES ('require_sub', ?)", (new_val,))
+    status = "необязательна" if new_val == '0' else "обязательна"
+    await callback.answer(f"Подписка теперь {status}.")
+    await admin_channels_cb(callback)
 
 # --- Админ: Редкости
 @dp.callback_query(F.data == "admin_rarities")
-async def admin_rarities(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        await cb.answer("⛔ Нет доступа", show_alert=True)
+async def admin_rarities_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     try:
-        await cb.message.edit_text("🛡️ Управление редкостями", reply_markup=kb_admin_rarities())
+        await callback.message.edit_text("🛡️ Управление редкостями", reply_markup=kb_admin_rarities())
     except TelegramBadRequest:
-        await cb.message.answer("🛡️ Управление редкостями", reply_markup=kb_admin_rarities())
+        await callback.message.answer("🛡️ Управление редкостями", reply_markup=kb_admin_rarities())
 
 @dp.callback_query(F.data == "admin_list_rarities")
-async def admin_list_rarities(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        await cb.answer("⛔ Нет доступа", show_alert=True)
+async def admin_list_rarities_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     rows = db_all("SELECT id, name FROM rarities ORDER BY id")
     if not rows:
         try:
-            await cb.message.edit_text("📋 Редкостей нет.", reply_markup=kb_admin_rarities())
+            await callback.message.edit_text("📋 Редкостей нет.", reply_markup=kb_admin_rarities())
         except TelegramBadRequest:
-            await cb.message.answer("📋 Редкостей нет.", reply_markup=kb_admin_rarities())
+            await callback.message.answer("📋 Редкостей нет.", reply_markup=kb_admin_rarities())
         return
     lines = ["📋 <b>Редкости</b>:"]
     for rid, name in rows:
         lines.append(f"#{rid}: {name}")
     try:
-        await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_rarities())
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb_admin_rarities())
     except TelegramBadRequest:
-        await cb.message.answer("\n".join(lines), reply_markup=kb_admin_rarities())
+        await callback.message.answer("\n".join(lines), reply_markup=kb_admin_rarities())
 
 @dp.callback_query(F.data == "admin_add_rarity")
 async def admin_add_rarity_start(cb: types.CallbackQuery, state: FSMContext):
@@ -1880,34 +1832,34 @@ async def admin_del_rarity_id(msg: types.Message, state: FSMContext):
 
 # --- Админ: Яйца
 @dp.callback_query(F.data == "admin_eggs")
-async def admin_eggs(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        await cb.answer("⛔ Нет доступа", show_alert=True)
+async def admin_eggs_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     try:
-        await cb.message.edit_text("🥚 Управление яйцами", reply_markup=kb_admin_eggs())
+        await callback.message.edit_text("🥚 Управление яйцами", reply_markup=kb_admin_eggs())
     except TelegramBadRequest:
-        await cb.message.answer("🥚 Управление яйцами", reply_markup=kb_admin_eggs())
+        await callback.message.answer("🥚 Управление яйцами", reply_markup=kb_admin_eggs())
 
 @dp.callback_query(F.data == "admin_list_eggs")
-async def admin_list_eggs(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        await cb.answer("⛔ Нет доступа", show_alert=True)
+async def admin_list_eggs_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     rows = db_all("SELECT id, name, price, hatch_time_sec FROM egg_types ORDER BY id")
     if not rows:
         try:
-            await cb.message.edit_text("📋 Яиц нет.", reply_markup=kb_admin_eggs())
+            await callback.message.edit_text("📋 Яиц нет.", reply_markup=kb_admin_eggs())
         except TelegramBadRequest:
-            await cb.message.answer("📋 Яиц нет.", reply_markup=kb_admin_eggs())
+            await callback.message.answer("📋 Яиц нет.", reply_markup=kb_admin_eggs())
         return
     lines = ["📋 <b>Яйца</b>:"]
     for eid, name, price, hts in rows:
-        lines.append(f"#{eid}: {name} — {price} оч., вылупление {hts} сек")
+        lines.append(f"#{eid}: {name} — {price} оч., вылупление {hts} сек.")
     try:
-        await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_eggs())
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb_admin_eggs())
     except TelegramBadRequest:
-        await cb.message.answer("\n".join(lines), reply_markup=kb_admin_eggs())
+        await callback.message.answer("\n".join(lines), reply_markup=kb_admin_eggs())
 
 @dp.callback_query(F.data == "admin_add_egg")
 async def admin_add_egg_start(cb: types.CallbackQuery, state: FSMContext):
@@ -1954,7 +1906,8 @@ async def admin_add_egg_hts(msg: types.Message, state: FSMContext):
         await msg.answer("Время - целое >=0.")
         return
     data = await state.get_data()
-    db_exec("INSERT INTO egg_types (name, price, hatch_time_sec) VALUES (?, ?, ?)", (data["name"], data["price"], hts))
+    db_exec("INSERT INTO egg_types (name, price, hatch_time_sec) VALUES (?, ?, ?)",
+            (data["name"], data["price"], hts))
     await state.clear()
     await msg.answer("✅ Яйцо добавлено.", reply_markup=kb_admin_eggs())
 
@@ -2070,20 +2023,21 @@ async def admin_del_egg_id(msg: types.Message, state: FSMContext):
     await state.clear()
     await msg.answer(f"🗑 Удалено яйцо '{row[0]}'.", reply_markup=kb_admin_eggs())
 
+# --- Админ: Random Egg шансы
 @dp.callback_query(F.data == "admin_random_egg")
-async def admin_random_egg(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        await cb.answer("⛔ Нет доступа", show_alert=True)
+async def admin_random_egg_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     try:
-        await cb.message.edit_text("✏ Настройка Random Egg", reply_markup=kb_admin_random_egg())
+        await callback.message.edit_text("✏ Настройка Random Egg", reply_markup=kb_admin_random_egg())
     except TelegramBadRequest:
-        await cb.message.answer("✏ Настройка Random Egg", reply_markup=kb_admin_random_egg())
+        await callback.message.answer("✏ Настройка Random Egg", reply_markup=kb_admin_random_egg())
 
 @dp.callback_query(F.data == "admin_list_egg_chances")
-async def admin_list_egg_chances(cb: types.CallbackQuery):
-    if not ensure_admin(cb):
-        await cb.answer("⛔ Нет доступа", show_alert=True)
+async def admin_list_egg_chances_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
         return
     random_egg_id = db_one("SELECT id FROM egg_types WHERE name='Random Egg'")[0]
     rows = db_all("""
@@ -2094,17 +2048,17 @@ async def admin_list_egg_chances(cb: types.CallbackQuery):
     """, (random_egg_id,))
     if not rows:
         try:
-            await cb.message.edit_text("📋 Шансов нет.", reply_markup=kb_admin_random_egg())
+            await callback.message.edit_text("📋 Шансов нет.", reply_markup=kb_admin_random_egg())
         except TelegramBadRequest:
-            await cb.message.answer("📋 Шансов нет.", reply_markup=kb_admin_random_egg())
+            await callback.message.answer("📋 Шансов нет.", reply_markup=kb_admin_random_egg())
         return
     lines = ["📋 <b>Шансы для Random Egg</b>:"]
     for name, chance in rows:
         lines.append(f"{name}: {chance:.2f}")
     try:
-        await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_random_egg())
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb_admin_random_egg())
     except TelegramBadRequest:
-        await cb.message.answer("\n".join(lines), reply_markup=kb_admin_random_egg())
+        await callback.message.answer("\n".join(lines), reply_markup=kb_admin_random_egg())
 
 @dp.callback_query(F.data == "admin_add_egg_chance")
 async def admin_add_egg_chance_start(cb: types.CallbackQuery, state: FSMContext):
@@ -2142,9 +2096,10 @@ async def admin_add_egg_chance_chance(msg: types.Message, state: FSMContext):
         return
     data = await state.get_data()
     random_egg_id = db_one("SELECT id FROM egg_types WHERE name='Random Egg'")[0]
-    db_exec("INSERT OR REPLACE INTO egg_chances (random_egg_id, egg_id, chance) VALUES (?, ?, ?)", (random_egg_id, data["egg_id"], chance))
+    db_exec("INSERT OR REPLACE INTO egg_chances (random_egg_id, egg_id, chance) VALUES (?, ?, ?)",
+            (random_egg_id, data["egg_id"], chance))
     await state.clear()
-    await msg.answer("✅ Шанс добавлен/обновлён.", reply_markup=kb_admin_random_egg())
+    await msg.answer("✅ Шанс добавлен.", reply_markup=kb_admin_random_egg())
 
 @dp.callback_query(F.data == "admin_edit_egg_chance")
 async def admin_edit_egg_chance_start(cb: types.CallbackQuery, state: FSMContext):
@@ -2213,6 +2168,16 @@ async def admin_del_egg_chance_eid(msg: types.Message, state: FSMContext):
     await msg.answer("🗑 Шанс удалён.", reply_markup=kb_admin_random_egg())
 
 # --- Админ: Питомцы конфиг
+@dp.callback_query(F.data == "admin_pets")
+async def admin_pets_menu(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text("🐶 Управление питомцами", reply_markup=kb_admin_pets())
+    except TelegramBadRequest:
+        await callback.message.answer("🐶 Управление питомцами", reply_markup=kb_admin_pets())
+
 @dp.callback_query(F.data == "admin_pets_config")
 async def admin_pets_config(cb: types.CallbackQuery):
     if not ensure_admin(cb):
@@ -3001,6 +2966,16 @@ async def cadmin_orders_cb(callback: types.CallbackQuery):
     except TelegramBadRequest:
         await callback.message.answer(text, reply_markup=kb_admin_cshop())
 
+@dp.callback_query(F.data == "admin_items")
+async def admin_items_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text("🛍 Управление товарами", reply_markup=kb_admin_items())
+    except TelegramBadRequest:
+        await callback.message.answer("🛍 Управление товарами", reply_markup=kb_admin_items())
+
 @dp.callback_query(F.data == "admin_add")
 async def admin_add_start(cb: types.CallbackQuery, state: FSMContext):
     if not ensure_admin(cb): return
@@ -3144,6 +3119,16 @@ async def admin_list_items(cb: types.CallbackQuery):
         await cb.message.edit_text("\n".join(lines), reply_markup=kb_admin_items())
     except TelegramBadRequest:
         await cb.message.answer("\n".join(lines), reply_markup=kb_admin_items())
+
+@dp.callback_query(F.data == "admin_cshop")
+async def admin_cshop_cb(callback: types.CallbackQuery):
+    if not ensure_admin(callback):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text("💱 Управление крипто-магазином", reply_markup=kb_admin_cshop())
+    except TelegramBadRequest:
+        await callback.message.answer("💱 Управление крипто-магазином", reply_markup=kb_admin_cshop())
 
 # --- Крипто-админ
 @dp.callback_query(F.data == "cadmin_add")
@@ -3292,7 +3277,7 @@ async def cadmin_list_items(cb: types.CallbackQuery):
 
 # Обеспечение админ-доступа
 def ensure_admin(obj: types.CallbackQuery | types.Message) -> bool:
-    user_id = obj.from_user.id if isinstance(obj, types.CallbackQuery) else obj.from_user.id
+    user_id = obj.from_user.id
     if user_id not in ADMIN_IDS:
         if isinstance(obj, types.CallbackQuery):
             obj.answer("⛔ Нет доступа", show_alert=True)
