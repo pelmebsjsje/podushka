@@ -1,11 +1,23 @@
-# ===== Render-friendly config (env vars) =====
+import asyncio
+import csv
 import os
 import sqlite3
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
+import time
 from typing import Optional, Tuple, List
+import html  # для безопасного экранирования имён в HTML-сообщениях
+import random
+from collections import defaultdict
+
+import aiohttp
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatType
+from aiogram.filters import CommandStart, Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.exceptions import TelegramBadRequest
 
 
 def _env_int(name: str, default: int) -> int:
