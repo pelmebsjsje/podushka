@@ -18,7 +18,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.utils.markdown import apply_html_entities  # Добавлен импорт для обработки caption
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1759,7 +1758,7 @@ async def admin_broadcast_start(cb: types.CallbackQuery, state: FSMContext):
 @dp.message(Broadcast.content)
 async def broadcast_content(msg: types.Message, state: FSMContext):
     if not ensure_admin(msg): return
-    content = msg.html_text or ""  # Используем msg.html_text для текста или caption
+    content = msg.html_text if (msg.text or msg.caption) else ""  # Используем msg.html_text для текста или caption
     if msg.photo or msg.video or msg.document or msg.audio or msg.voice:
         # Если есть медиа, сохраняем file_id
         if msg.photo:
